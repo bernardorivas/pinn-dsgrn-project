@@ -63,7 +63,7 @@ pinn_discontinuous/
 
 ### Running Experiments
 
-Run the full experimental suite (120 experiments by default: 3 data types × 2 approximation types × 20 runs):
+Run the full experimental suite (6 experiments by default: 3 data types × 2 approximation types × 1 run):
 
 ```bash
 python run_experiments.py
@@ -79,15 +79,28 @@ python run_experiments.py --config configs/custom_config.yaml
 
 Edit `configs/experiment_config.yaml` to customize:
 
+- Number of runs per experiment (default: 1, set `n_runs: 20` for statistical analysis)
 - Number of trajectories and time points
+- Ground truth parameters (`hill_n: 10.0`, `pw_h: 1.0`)
 - Model architecture (hidden layers, SIREN frequency)
 - Training hyperparameters (learning rate, epochs, patience)
 - Loss function weights
 - Device selection ('mps', 'cuda', or 'cpu')
 
-### Analysis
+### Generating Plots
 
-After experiments complete, run the analysis notebook:
+After experiments complete, generate summary plots:
+
+```bash
+python plot_summary.py
+```
+
+This creates:
+- Parameter summary bar charts
+- Scatter plots by approximation type
+- Training curve visualizations
+
+Alternatively, use the analysis notebook:
 
 ```bash
 jupyter notebook notebooks/analysis.ipynb
@@ -98,8 +111,8 @@ jupyter notebook notebooks/analysis.ipynb
 ### Three Data Sources
 
 1. **Heaviside (discontinuous):** True vector field with step functions
-2. **Hill (steep continuous):** Vector field with `n = 50` (nearly discontinuous)
-3. **Piecewise (steep continuous):** Vector field with `h = 0.01` (narrow transition)
+2. **Hill (steep continuous):** Vector field with `n = 10` (steep)
+3. **Piecewise (steep continuous):** Vector field with `h = 1.0` (moderate transition width)
 
 ### Two Approximation Types
 
@@ -109,7 +122,7 @@ jupyter notebook notebooks/analysis.ipynb
 ### Experiment Matrix
 
 ```
-3 data types × 2 approximation types × 20 random seeds = 120 training runs
+3 data types × 2 approximation types × 1 run = 6 training runs
 ```
 
 For each (data_type, approx_type) pair:
@@ -138,7 +151,7 @@ Combined loss:
 ## Expected Outputs
 
 1. **Main Results Table** (`results/experiment_results.csv`):
-   - 120 rows with final parameters, losses, convergence epochs
+   - 6 rows with final parameters, losses, convergence epochs
    - Statistical summary printed to console
 
 2. **Training Curves** (`results/training_curves/*.csv`):
@@ -151,7 +164,7 @@ Combined loss:
 
 ## Success Criteria
 
-1. All 120 experiments complete without errors
+1. All experiments complete without errors
 2. Gathered learned parameters, training data, etc.
 3. Confidence intervals [\mu - \sigma, \mu + \sigma] have reasonable width (\sigma/\mu < 0.3)
 4. Learned params are validated by DSGRN (or analytical) bounds
