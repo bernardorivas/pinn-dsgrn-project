@@ -1,0 +1,43 @@
+# Data Generation Parameters
+data_generation:
+  n_traj: 10
+  t_span: [0.0, 5.0]
+  n_points: 200              # Uniform grid: \Delta t = 0.025
+  ic_bounds: [0.0, 6.0]      # Latin hypercube sampling range
+
+  # ODE parameters (fixed across all experiments)
+  U: [5.0, 5.0]
+  L: [1.0, 1.0]
+  T: [3.0, 3.0]
+
+  # Ground truth steepness for synthetic data
+  hill_n: 10.0               # Hill exponent for "hill" data type
+  pw_h: 0.10                 # Width for "piecewise" data type
+
+# Model Architecture
+model:
+  hidden_dim: 32
+  n_layers: 4
+  omega0: 30.0               # SIREN frequency parameter
+  init_steepness: 1.0        # Initial guess for n (Hill) or 1/h (piecewise)
+
+# Training Parameters
+training:
+  n_runs: 20                 # Number of random seeds per (data, approx) pair
+  base_seed: 1000            # Starting seed (incremented for each run)
+  max_epochs: 10000
+  lr: 0.001
+  patience: 500              # Early stopping patience
+  log_interval: 100          # Print every N epochs
+  device: 'mps'              # 'mps' for Apple Silicon, 'cuda' for NVIDIA, 'cpu'
+
+  # Loss function weights
+  loss_weights:
+    data: 1.0
+    physics: 1.0
+    ic: 1.0
+
+# Analysis Parameters
+analysis:
+  confidence_level: 0.68     # 1-sigma confidence interval (\mu \pm \sigma)
+  plot_n_representative: 5   # Number of training curves to plot per group
