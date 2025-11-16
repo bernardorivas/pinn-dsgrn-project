@@ -129,7 +129,7 @@ The project uses a **SIREN (Sinusoidal Representation Network)** architecture:
 
 ## Loss Function
 
-Combined physics-informed loss:
+Combined loss:
 
 - **Data loss:** MSE between prediction and ground truth trajectories
 - **Physics loss:** ODE residual via automatic differentiation
@@ -152,10 +152,9 @@ Combined physics-informed loss:
 ## Success Criteria
 
 1. All 120 experiments complete without errors
-2. Learned parameters for matching cases close to ground truth
+2. Gathered learned parameters, training data, etc.
 3. Confidence intervals [\mu - \sigma, \mu + \sigma] have reasonable width (\sigma/\mu < 0.3)
-4. Training curves show convergence
-5. Learned params produce trajectories with low error vs ground truth
+4. Learned params are validated by DSGRN (or analytical) bounds
 
 ## Dependencies
 

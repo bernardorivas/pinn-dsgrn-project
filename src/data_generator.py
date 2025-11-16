@@ -3,8 +3,8 @@ Data generation module for PINN discontinuous ODE steepness learning.
 
 Generates trajectory data for three approximation types:
 - Heaviside (discontinuous true vector field)
-- Hill (steep Hill function approximation, n=50)
-- Piecewise (steep piecewise linear approximation, h=0.01)
+- Hill (steep Hill function approximation, n=10)
+- Piecewise (steep piecewise linear approximation, h=1.0)
 
 Core system of ODEs:
 x0' = -x0 + U[0] + H(T[0] - x1) * (L[0] - U[0])

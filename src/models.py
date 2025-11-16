@@ -106,7 +106,7 @@ class SIREN(nn.Module):
 
 class DiscontinuousPINN(nn.Module):
     """
-    Physics-informed neural network for learning steepness in discontinuous ODEs.
+    Physics-informed neural network
 
     This network learns to approximate the solution of a 2D ODE system while also
     learning the steepness parameters (Hill exponent n or piecewise width h) of

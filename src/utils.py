@@ -307,8 +307,8 @@ def plot_parameter_scatter_split(
         # Formatting - create labels with ground truth parameters
         label_map = {
             'heaviside': 'heaviside',
-            'hill': 'hill (n=50)',
-            'piecewise': 'piecewise (h=0.01)'
+            'hill': 'hill (n=10)',
+            'piecewise': 'piecewise (h=1.0)'
         }
         x_labels = [label_map.get(dt, dt) for dt in data_types]
         
@@ -429,9 +429,9 @@ def plot_all_training_curves(
     
     # Create title with ground truth info
     if data_type == 'hill':
-        data_label = f'{data_type} (n=50)'
+        data_label = f'{data_type} (n=10)'
     elif data_type == 'piecewise':
-        data_label = f'{data_type} (h=0.01)'
+        data_label = f'{data_type} (h=1.0)'
     else:
         data_label = data_type
     
@@ -448,7 +448,7 @@ def plot_all_training_curves(
 
 
 def compute_confidence_intervals(results_df: pd.DataFrame) -> pd.DataFrame:
-    """
+    r"""
     Compute \mu \pm \sigma confidence intervals for each (data_type, approx_type) group.
 
     Groups the results by data_type and approx_type, then computes summary
@@ -467,9 +467,9 @@ def compute_confidence_intervals(results_df: pd.DataFrame) -> pd.DataFrame:
         Summary dataframe with columns:
         - data_type, approx_type: grouping keys
         - param_0_mean, param_0_std: mean and std of param_0
-        - param_0_ci_lower, param_0_ci_upper: \mu - \sigma and \mu + \sigma bounds
+        - param_0_ci_lower, param_0_ci_upper: mu - sigma and mu + sigma bounds
         - param_1_mean, param_1_std: mean and std of param_1
-        - param_1_ci_lower, param_1_ci_upper: \mu - \sigma and \mu + \sigma bounds
+        - param_1_ci_lower, param_1_ci_upper: mu - sigma and mu + sigma bounds
         - n_runs: number of runs in the group
         - mean_final_loss, std_final_loss: statistics of final loss
     """

@@ -1,10 +1,10 @@
 """
-Experiment runner module for PINN discontinuous ODE steepness learning.
+Experiment module.
 
-Implements the main experimental pipeline:
+Implements the main pipeline:
 - Loads configuration from YAML
 - Generates or loads training data
-- Runs full experimental suite (3 data types × 2 approximation types × N runs)
+- Runs full pipeline (3 data types x 2 approximation types x N runs)
 - Trains models and collects results
 - Computes and displays summary statistics
 """
