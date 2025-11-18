@@ -42,3 +42,6 @@ wheels/
 # claude files and directories
 .serena/
 .claude/
+
+# latex
+draft/
