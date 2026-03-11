@@ -22,7 +22,7 @@ NET_SPEC = "1 : 1+2\n2 : (~1)2"
 
 # Which (par_index, d_values) to run
 RECOVERY_TARGETS = {
-    752: [32],
+    752: [50],
 }
 
 # PINN model config

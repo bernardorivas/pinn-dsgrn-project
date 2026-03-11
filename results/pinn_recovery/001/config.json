@@ -1,0 +1,29 @@
+{
+  "sweep_id": "001",
+  "net_spec": "1 : 1+2\n2 : (~1)2",
+  "recovery_targets": {
+    "752": [
+      50
+    ]
+  },
+  "pinn": {
+    "hidden_dim": 128,
+    "n_layers": 5,
+    "omega0": 30.0,
+    "approx_type": "hill",
+    "init_steepness": 4.0
+  },
+  "training": {
+    "device": "mps",
+    "max_epochs": 50000,
+    "lr": 0.001,
+    "patience": 3000,
+    "loss_weights": {
+      "data": 1.0,
+      "physics": 1.0,
+      "ic": 1.0
+    }
+  },
+  "base_seed": 2000,
+  "save_checkpoints": true
+}
