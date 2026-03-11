@@ -1,38 +1,329 @@
-"""Utility functions for visualization and analysis of PINN training results."""
+"""Visualization and analysis utilities for DSGRN PINN experiments."""
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+from pathlib import Path
 
 
-def plot_training_curves(
-    history_df: pd.DataFrame,
-    save_path: str = None,
-    title: str = "Training Curves"
-):
+def next_run_id(base_dir):
+    """Find the next auto-incrementing run ID (001, 002, ...) under base_dir."""
+    base_dir = Path(base_dir)
+    if not base_dir.exists():
+        return "001"
+    existing = [d.name for d in base_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+    if not existing:
+        return "001"
+    return f"{max(int(x) for x in existing) + 1:03d}"
+
+
+def plot_initial_conditions(ics, trapping_box, T=None, save_path=None):
     """
-    Plot loss evolution and parameter evolution during training.
+    Plot initial conditions on 2D phase plane with trapping box.
 
-    Creates a 2x2 subplot figure showing:
-    - (0,0): Semilogy plot of all loss components vs epoch
-    - (0,1): Linear scale plot of total loss vs epoch
-    - (1,0): Linear plot of steepness parameters vs epoch
-    - (1,1): Semilogy plot of steepness parameters vs epoch
+    Args:
+        ics: (n_traj, 2) array of initial conditions
+        trapping_box: (2,) array of upper bounds [B0, B1]
+        T: optional (n_nodes, n_nodes) threshold matrix for drawing threshold lines
+        save_path: path to save figure
+    """
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(ics[:, 0], ics[:, 1], s=60, c='steelblue', edgecolors='k', zorder=5)
 
-    Parameters
-    ----------
-    history_df : pd.DataFrame
-        Training history with columns: ['epoch', 'loss_total', 'loss_data',
-        'loss_physics', 'loss_ic', 'param_0', 'param_1']
-    save_path : str, optional
-        Path to save the figure. If None, displays the plot.
-    title : str, default="Training Curves"
-        Title for the figure.
+    # Trapping box
+    B0, B1 = trapping_box
+    rect = plt.Rectangle((0, 0), B0, B1, fill=False, edgecolor='red',
+                          linewidth=2, linestyle='--', label='Trapping box')
+    ax.add_patch(rect)
+
+    # Threshold lines from T matrix (draw T[src, tgt] as lines on the axis of src)
+    if T is not None:
+        T = np.asarray(T)
+        n = T.shape[0]
+        colors = ['green', 'purple', 'orange', 'brown']
+        for s in range(min(n, 2)):
+            for t in range(min(n, 2)):
+                if T[s, t] > 0:
+                    c = colors[(s * n + t) % len(colors)]
+                    if s == 0:
+                        ax.axvline(T[s, t], color=c, linestyle=':', alpha=0.7,
+                                   label=f'T[{s},{t}]={T[s,t]:.2f}')
+                    else:
+                        ax.axhline(T[s, t], color=c, linestyle=':', alpha=0.7,
+                                   label=f'T[{s},{t}]={T[s,t]:.2f}')
+
+    ax.set_xlabel('$x_0$', fontsize=12)
+    ax.set_ylabel('$x_1$', fontsize=12)
+    ax.set_title('Initial Conditions', fontsize=14)
+    ax.set_xlim(-0.2, B0 * 1.1)
+    ax.set_ylim(-0.2, B1 * 1.1)
+    ax.legend(fontsize=9)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def plot_trajectories_timeseries(data, n_nodes=2, save_path=None):
+    """
+    Plot time series x_i(t) subplots, one line per trajectory.
+
+    Args:
+        data: DataFrame with traj_id, t, x0, x1, ...
+        n_nodes: number of state variables
+        save_path: path to save figure
+    """
+    fig, axes = plt.subplots(1, n_nodes, figsize=(7 * n_nodes, 5))
+    if n_nodes == 1:
+        axes = [axes]
+
+    for i in range(n_nodes):
+        ax = axes[i]
+        for tid in data['traj_id'].unique():
+            traj = data[data['traj_id'] == tid]
+            ax.plot(traj['t'], traj[f'x{i}'], alpha=0.6, linewidth=1)
+        ax.set_xlabel('$t$', fontsize=12)
+        ax.set_ylabel(f'$x_{i}$', fontsize=12)
+        ax.set_title(f'$x_{i}(t)$', fontsize=14)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle('Trajectory Time Series', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def plot_phase_portrait(topology, L, U, T, gamma, approx_type, steepness,
+                        trajectories=None, ics=None, trapping_box=None,
+                        n_grid=25, save_path=None):
+    """
+    Plot 2D phase portrait with streamplot, optional trajectory overlay.
+
+    Only works for 2-node systems.
+    """
+    from ode_builder import build_ode_rhs_np
+
+    L = np.asarray(L)
+    U = np.asarray(U)
+    T = np.asarray(T)
+    gamma = np.asarray(gamma)
+    steepness = np.asarray(steepness)
+
+    if trapping_box is None:
+        trapping_box = topology.trapping_box(U, gamma)
+
+    B0, B1 = trapping_box[0], trapping_box[1]
+    rhs_fn = build_ode_rhs_np(topology, L, U, T, gamma, approx_type, steepness)
+
+    x0_grid = np.linspace(0.01, B0 * 1.05, n_grid)
+    x1_grid = np.linspace(0.01, B1 * 1.05, n_grid)
+    X0, X1 = np.meshgrid(x0_grid, x1_grid)
+
+    DX0 = np.zeros_like(X0)
+    DX1 = np.zeros_like(X1)
+    for i in range(n_grid):
+        for j in range(n_grid):
+            dy = rhs_fn(0, [X0[i, j], X1[i, j]])
+            DX0[i, j] = dy[0]
+            DX1[i, j] = dy[1]
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    ax.streamplot(x0_grid, x1_grid, DX0, DX1, color='#555555',
+                  linewidth=0.8, density=1.5, arrowsize=1.2)
+
+    # Nullclines on a finer grid
+    n_null = 500
+    x0_fine = np.linspace(0.01, B0 * 1.05, n_null)
+    x1_fine = np.linspace(0.01, B1 * 1.05, n_null)
+    X0f, X1f = np.meshgrid(x0_fine, x1_fine)
+    DX0f = np.zeros_like(X0f)
+    DX1f = np.zeros_like(X1f)
+    for i in range(n_null):
+        for j in range(n_null):
+            dy = rhs_fn(0, [X0f[i, j], X1f[i, j]])
+            DX0f[i, j] = dy[0]
+            DX1f[i, j] = dy[1]
+    c0 = ax.contour(X0f, X1f, DX0f, levels=[0], colors='#e41a1c', linewidths=1.5)
+    c1 = ax.contour(X0f, X1f, DX1f, levels=[0], colors='#377eb8', linewidths=1.5)
+    # Add legend proxy lines (avoids matplotlib version issues with collections)
+    ax.plot([], [], color='#e41a1c', linewidth=1.5, label="$x_0' = 0$")
+    ax.plot([], [], color='#377eb8', linewidth=1.5, label="$x_1' = 0$")
+
+    if trajectories is not None:
+        for tid in trajectories['traj_id'].unique():
+            traj = trajectories[trajectories['traj_id'] == tid]
+            ax.plot(traj['x0'], traj['x1'], 'k-', alpha=0.5, linewidth=1)
+
+    # Threshold lines
+    n_nodes = topology.n_nodes
+    for s in range(min(n_nodes, 2)):
+        for t_idx in range(min(n_nodes, 2)):
+            if T[s, t_idx] > 0:
+                if s == 0:
+                    ax.axvline(T[s, t_idx], color='white', linestyle='--', alpha=0.7)
+                else:
+                    ax.axhline(T[s, t_idx], color='white', linestyle='--', alpha=0.7)
+
+    ax.set_xlabel('$x_0$', fontsize=12)
+    ax.set_ylabel('$x_1$', fontsize=12)
+    ax.set_title('Phase Portrait', fontsize=14)
+    ax.set_xlim(0, B0 * 1.05)
+    ax.set_ylim(0, B1 * 1.05)
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def plot_trajectories_comparison(data_true, data_rec, n_nodes=2, save_path=None):
+    """
+    Overlay ground truth (solid) and recovered (dashed) time series.
+    """
+    fig, axes = plt.subplots(1, n_nodes, figsize=(7 * n_nodes, 5))
+    if n_nodes == 1:
+        axes = [axes]
+
+    colors = plt.cm.tab10.colors
+    traj_ids = sorted(data_true['traj_id'].unique())
+
+    for i in range(n_nodes):
+        ax = axes[i]
+        for k, tid in enumerate(traj_ids):
+            c = colors[k % len(colors)]
+            gt = data_true[data_true['traj_id'] == tid]
+            ax.plot(gt['t'], gt[f'x{i}'], '-', color=c, alpha=0.7, linewidth=1.5)
+            if data_rec is not None:
+                rc = data_rec[data_rec['traj_id'] == tid]
+                if len(rc) > 0:
+                    ax.plot(rc['t'], rc[f'x{i}'], '--', color=c, alpha=0.7, linewidth=1.5)
+        ax.set_xlabel('$t$', fontsize=12)
+        ax.set_ylabel(f'$x_{i}$', fontsize=12)
+        ax.set_title(f'$x_{i}(t)$: solid=GT, dashed=recovered', fontsize=12)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle('Trajectory Comparison', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def plot_phase_portrait_comparison(topology, params_true, params_rec,
+                                   trajectories=None, save_path=None):
+    """Side-by-side phase portraits: ground truth vs recovered."""
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+
+    for ax, params, title in [
+        (axes[0], params_true, 'Ground Truth'),
+        (axes[1], params_rec, 'Recovered'),
+    ]:
+        _draw_streamplot_on_ax(ax, topology, params, trajectories)
+        ax.set_title(title, fontsize=14)
+
+    plt.suptitle('Phase Portrait Comparison', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def _draw_streamplot_on_ax(ax, topology, params, trajectories=None, n_grid=25):
+    """Helper to draw a streamplot on a given axes."""
+    from ode_builder import build_ode_rhs_np
+
+    L, U, T = np.asarray(params['L']), np.asarray(params['U']), np.asarray(params['T'])
+    gamma = np.asarray(params['gamma'])
+    steepness = np.asarray(params['steepness'])
+    approx_type = params['approx_type']
+
+    box = topology.trapping_box(U, gamma)
+    B0, B1 = box[0], box[1]
+    rhs_fn = build_ode_rhs_np(topology, L, U, T, gamma, approx_type, steepness)
+
+    x0g = np.linspace(0.01, B0 * 1.05, n_grid)
+    x1g = np.linspace(0.01, B1 * 1.05, n_grid)
+    X0, X1 = np.meshgrid(x0g, x1g)
+    DX0, DX1 = np.zeros_like(X0), np.zeros_like(X1)
+    for i in range(n_grid):
+        for j in range(n_grid):
+            dy = rhs_fn(0, [X0[i, j], X1[i, j]])
+            DX0[i, j], DX1[i, j] = dy[0], dy[1]
+
+    ax.streamplot(x0g, x1g, DX0, DX1, color='#555555',
+                  linewidth=0.8, density=1.2, arrowsize=1.0)
+
+    # Nullclines on a finer grid
+    n_null = 500
+    x0f = np.linspace(0.01, B0 * 1.05, n_null)
+    x1f = np.linspace(0.01, B1 * 1.05, n_null)
+    X0f, X1f = np.meshgrid(x0f, x1f)
+    DX0f, DX1f = np.zeros_like(X0f), np.zeros_like(X1f)
+    for i in range(n_null):
+        for j in range(n_null):
+            dy = rhs_fn(0, [X0f[i, j], X1f[i, j]])
+            DX0f[i, j], DX1f[i, j] = dy[0], dy[1]
+    c0 = ax.contour(X0f, X1f, DX0f, levels=[0], colors='#e41a1c', linewidths=1.5)
+    c1 = ax.contour(X0f, X1f, DX1f, levels=[0], colors='#377eb8', linewidths=1.5)
+    # Add legend proxy lines (avoids matplotlib version issues with collections)
+    ax.plot([], [], color='#e41a1c', linewidth=1.5, label="$x_0' = 0$")
+    ax.plot([], [], color='#377eb8', linewidth=1.5, label="$x_1' = 0$")
+
+    if trajectories is not None:
+        for tid in trajectories['traj_id'].unique():
+            tr = trajectories[trajectories['traj_id'] == tid]
+            ax.plot(tr['x0'], tr['x1'], 'k-', alpha=0.4, linewidth=0.8)
+
+    ax.legend(fontsize=8)
+
+    ax.set_xlabel('$x_0$', fontsize=12)
+    ax.set_ylabel('$x_1$', fontsize=12)
+    ax.set_xlim(0, B0 * 1.05)
+    ax.set_ylim(0, B1 * 1.05)
+
+
+def plot_parameter_comparison(L_true, U_true, T_true, L_hat, U_hat, T_hat,
+                              save_path=None):
+    """Heatmap comparison of ground truth vs recovered parameter matrices."""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    names = ['L', 'U', 'T']
+    true_mats = [np.asarray(L_true), np.asarray(U_true), np.asarray(T_true)]
+    hat_mats = [np.asarray(L_hat), np.asarray(U_hat), np.asarray(T_hat)]
+
+    for j, (name, gt, rec) in enumerate(zip(names, true_mats, hat_mats)):
+        axes[0, j].imshow(np.ones_like(gt), cmap='gray_r', vmin=0, vmax=1, aspect='auto')
+        axes[0, j].set_title(f'{name} (GT)', fontsize=12)
+        _annotate_heatmap(axes[0, j], gt, force_black=True)
+
+        diff = rec - gt
+        vmax = max(abs(diff.min()), abs(diff.max()), 0.01)
+        im1 = axes[1, j].imshow(diff, cmap='RdBu_r', aspect='auto',
+                                 vmin=-vmax, vmax=vmax)
+        axes[1, j].set_title(f'{name} (Rec - GT)', fontsize=12)
+        plt.colorbar(im1, ax=axes[1, j], fraction=0.046)
+        _annotate_heatmap(axes[1, j], diff)
+
+    plt.suptitle('Parameter Comparison', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def _annotate_heatmap(ax, mat, force_black=False):
+    """Annotate heatmap cells with values."""
+    absmax = np.abs(mat).max() if np.abs(mat).max() > 0 else 1.0
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            if force_black:
+                color = 'black'
+            else:
+                color = 'white' if abs(mat[i, j]) > 0.5 * absmax else 'black'
+            ax.text(j, i, f'{mat[i, j]:.3f}', ha='center', va='center',
+                    fontsize=10, color=color)
+
+
+def plot_training_curves(history_df, topology=None, save_path=None,
+                         title="Training Curves"):
+    """
+    Plot loss and parameter evolution during training.
+
+    Creates a 2-row figure: top row for losses, bottom row for parameters.
     """
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # Loss curves (semilogy)
+    # Loss curves
     axes[0, 0].semilogy(history_df['epoch'], history_df['loss_total'], label='Total')
     axes[0, 0].semilogy(history_df['epoch'], history_df['loss_data'], label='Data')
     axes[0, 0].semilogy(history_df['epoch'], history_df['loss_physics'], label='Physics')
@@ -43,456 +334,102 @@ def plot_training_curves(
     axes[0, 0].set_title('Loss Components')
     axes[0, 0].grid(True, alpha=0.3)
 
-    # Total loss only (linear scale)
     axes[0, 1].plot(history_df['epoch'], history_df['loss_total'])
     axes[0, 1].set_xlabel('Epoch')
     axes[0, 1].set_ylabel('Total Loss')
-    axes[0, 1].set_title('Total Loss (Linear Scale)')
+    axes[0, 1].set_title('Total Loss (Linear)')
     axes[0, 1].grid(True, alpha=0.3)
 
-    # Parameter evolution (linear scale)
-    axes[1, 0].plot(history_df['epoch'], history_df['param_0'], label='Param 0')
-    axes[1, 0].plot(history_df['epoch'], history_df['param_1'], label='Param 1')
+    # Parameter evolution: find all L_*, U_*, T_*, d_* columns
+    param_cols = [c for c in history_df.columns if c.startswith(('L_', 'U_', 'T_', 'd_'))]
+
+    lut_cols = [c for c in param_cols if not c.startswith('d_')]
+    d_cols = [c for c in param_cols if c.startswith('d_')]
+
+    for c in lut_cols:
+        axes[1, 0].plot(history_df['epoch'], history_df[c], label=c, alpha=0.7)
     axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Steepness Parameter')
-    axes[1, 0].legend()
-    axes[1, 0].set_title('Learned Steepness Parameters')
+    axes[1, 0].set_ylabel('Value')
+    axes[1, 0].set_title('L, U, T Evolution')
+    axes[1, 0].legend(fontsize=8, ncol=2)
     axes[1, 0].grid(True, alpha=0.3)
 
-    # Parameter evolution (log scale)
-    axes[1, 1].semilogy(history_df['epoch'], history_df['param_0'], label='Param 0')
-    axes[1, 1].semilogy(history_df['epoch'], history_df['param_1'], label='Param 1')
+    for c in d_cols:
+        axes[1, 1].semilogy(history_df['epoch'], history_df[c], label=c, alpha=0.7)
     axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('Steepness Parameter (log)')
-    axes[1, 1].legend()
-    axes[1, 1].set_title('Learned Steepness (Log Scale)')
+    axes[1, 1].set_ylabel('Steepness (log)')
+    axes[1, 1].set_title('Hill Exponent d Evolution')
+    axes[1, 1].legend(fontsize=8)
     axes[1, 1].grid(True, alpha=0.3)
 
     plt.suptitle(title, fontsize=14, fontweight='bold')
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-    else:
-        plt.show()
+    _save_or_show(fig, save_path)
 
 
-def plot_parameter_distributions(
-    results_df: pd.DataFrame,
-    save_path: str = None
-):
-    """
-    Plot histogram of learned parameters grouped by (data_type, approx_type).
-
-    Creates a grid of histograms with rows corresponding to data types and
-    columns corresponding to approximation types. For each subplot, displays
-    overlaid histograms of param_0 and param_1 with means and confidence bands.
-
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Results dataframe with columns: ['data_type', 'approx_type', 'param_0',
-        'param_1', 'final_loss', ...]
-    save_path : str, optional
-        Path to save the figure. If None, displays the plot.
-    """
-    data_types = results_df['data_type'].unique()
-    approx_types = results_df['approx_type'].unique()
-
-    fig, axes = plt.subplots(
-        len(data_types), len(approx_types),
-        figsize=(6 * len(approx_types), 5 * len(data_types))
-    )
-
-    # Reshape axes for single row/column case
-    if len(data_types) == 1:
-        axes = axes.reshape(1, -1)
-    if len(approx_types) == 1:
-        axes = axes.reshape(-1, 1)
-
-    for i, data_type in enumerate(data_types):
-        for j, approx_type in enumerate(approx_types):
-            ax = axes[i, j]
-
-            subset = results_df[
-                (results_df['data_type'] == data_type) &
-                (results_df['approx_type'] == approx_type)
-            ]
-
-            # Skip empty subsets
-            if len(subset) == 0:
-                continue
-
-            # Plot both parameters as histograms
-            ax.hist(
-                subset['param_0'], bins=20, alpha=0.6,
-                label='Param 0', color='blue', edgecolor='black'
-            )
-            ax.hist(
-                subset['param_1'], bins=20, alpha=0.6,
-                label='Param 1', color='red', edgecolor='black'
-            )
-
-            # Compute statistics
-            mu0, sigma0 = subset['param_0'].mean(), subset['param_0'].std()
-            mu1, sigma1 = subset['param_1'].mean(), subset['param_1'].std()
-
-            # Plot mean lines and confidence bands for param_0
-            ax.axvline(mu0, color='blue', linestyle='--', linewidth=2, label=f'$\\mu_0$={mu0:.2f}')
-            ax.axvspan(mu0 - sigma0, mu0 + sigma0, alpha=0.2, color='blue')
-
-            # Plot mean lines and confidence bands for param_1
-            ax.axvline(mu1, color='red', linestyle='--', linewidth=2, label=f'$\\mu_1$={mu1:.2f}')
-            ax.axvspan(mu1 - sigma1, mu1 + sigma1, alpha=0.2, color='red')
-
-            # Formatting
-            ax.set_xlabel('Steepness Parameter')
-            ax.set_ylabel('Frequency')
-            ax.set_title(f'Data: {data_type} | Approx: {approx_type}')
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-    else:
-        plt.show()
-
-
-def plot_parameter_summary_bars(
-    results_df: pd.DataFrame,
-    save_path: str = None
-):
-    """
-    Plot bar charts showing mean ± std for param_0 and param_1 across all
-    (data_type, approx_type) combinations.
-
-    Creates a 1x2 subplot figure with:
-    - Left panel: param_0 means with std error bars
-    - Right panel: param_1 means with std error bars
-
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Results dataframe with columns: ['data_type', 'approx_type', 'param_0',
-        'param_1', ...]
-    save_path : str, optional
-        Path to save the figure. If None, displays the plot.
-    """
-    # Compute summary statistics
-    summary = compute_confidence_intervals(results_df)
-    
-    # Create labels for x-axis: data_type/approx_type
-    summary['label'] = summary['data_type'] + '\n' + summary['approx_type']
-    
+def plot_morse_graph_comparison(gt_str, rec_str, save_path=None):
+    """Display ground truth vs recovered Morse graph strings side by side."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Plot param_0
-    ax0 = axes[0]
-    x_pos = np.arange(len(summary))
-    ax0.bar(x_pos, summary['param_0_mean'], yerr=summary['param_0_std'],
-            capsize=5, alpha=0.7, color='steelblue', edgecolor='black', linewidth=1.5)
-    ax0.set_xticks(x_pos)
-    ax0.set_xticklabels(summary['label'], rotation=0, ha='center')
-    ax0.set_ylabel('Parameter Value', fontsize=12)
-    ax0.set_title('param_0: Mean ± Std', fontsize=14, fontweight='bold')
-    ax0.grid(True, alpha=0.3, axis='y')
-    
-    # Annotate with exact values
-    for i, (mean, std) in enumerate(zip(summary['param_0_mean'], summary['param_0_std'])):
-        ax0.text(i, mean + std + 0.05 * mean, f'{mean:.2f}±{std:.2f}',
-                ha='center', va='bottom', fontsize=9)
-    
-    # Plot param_1
-    ax1 = axes[1]
-    ax1.bar(x_pos, summary['param_1_mean'], yerr=summary['param_1_std'],
-            capsize=5, alpha=0.7, color='coral', edgecolor='black', linewidth=1.5)
-    ax1.set_xticks(x_pos)
-    ax1.set_xticklabels(summary['label'], rotation=0, ha='center')
-    ax1.set_ylabel('Parameter Value', fontsize=12)
-    ax1.set_title('param_1: Mean ± Std', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3, axis='y')
-    
-    # Annotate with exact values
-    for i, (mean, std) in enumerate(zip(summary['param_1_mean'], summary['param_1_std'])):
-        ax1.text(i, mean + std + 0.05 * mean, f'{mean:.2f}±{std:.2f}',
-                ha='center', va='bottom', fontsize=9)
-    
-    plt.suptitle('Learned Parameters Across Experiment Types', fontsize=16, fontweight='bold', y=1.00)
+    for ax, label, text in [(axes[0], 'Ground Truth', gt_str),
+                            (axes[1], 'Recovered', rec_str)]:
+        ax.text(0.5, 0.5, text, ha='center', va='center', fontsize=10,
+                transform=ax.transAxes, family='monospace',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax.set_title(f'Morse Graph ({label})', fontsize=14)
+        ax.axis('off')
     plt.tight_layout()
-    
+    _save_or_show(fig, save_path)
+
+
+def plot_recovery_vs_d(cross_d_df, save_path=None):
+    """Bar + line plot: same_region (bool) and final_loss vs d_value."""
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    d_vals = cross_d_df['d_value'].values
+
+    colors = ['#2ecc71' if s else '#e74c3c' for s in cross_d_df['same_region']]
+    bar_width = 0.5 * np.min(np.diff(d_vals)) if len(d_vals) > 1 else 1.0
+    ax1.bar(d_vals, cross_d_df['same_region'].astype(int), color=colors,
+            alpha=0.5, width=bar_width, label='Same DSGRN region')
+    ax1.set_ylabel('Same Region (0/1)')
+    ax1.set_xlabel('Hill Coefficient $d$')
+    ax1.set_ylim(-0.1, 1.5)
+
+    ax2 = ax1.twinx()
+    ax2.semilogy(d_vals, cross_d_df['final_loss'], 'ko-', label='Final loss')
+    ax2.set_ylabel('Final Loss (log)')
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc='upper right')
+
+    ax1.set_title('Recovery vs Hill Coefficient', fontsize=14)
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def plot_mae_vs_d(cross_d_df, save_path=None):
+    """Line plot: L_mae, U_mae, T_mae vs d_value."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    d_vals = cross_d_df['d_value'].values
+    ax.plot(d_vals, cross_d_df['L_mae'], 'o-', label='L MAE')
+    ax.plot(d_vals, cross_d_df['U_mae'], 's-', label='U MAE')
+    ax.plot(d_vals, cross_d_df['T_mae'], '^-', label='T MAE')
+
+    ax.set_xlabel('Hill Coefficient $d$')
+    ax.set_ylabel('Mean Absolute Error')
+    ax.set_title('Parameter MAE vs Hill Coefficient', fontsize=14)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def _save_or_show(fig, save_path):
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     else:
         plt.show()
-
-
-
-def plot_parameter_scatter_split(
-    results_df: pd.DataFrame,
-    approx_type: str,
-    save_path: str = None
-):
-    """
-    Create scatterplot showing individual runs and mean±std for a specific
-    approximation type.
-
-    Creates a 1x2 subplot figure with:
-    - Left panel: param_0 values across data types
-    - Right panel: param_1 values across data types
-
-    Each subplot shows all individual run values as scatter points with the
-    mean as a larger marker and std as error bars.
-
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Results dataframe with columns: ['data_type', 'approx_type', 'param_0',
-        'param_1', ...]
-    approx_type : str
-        Which approximation type to plot ('hill' or 'piecewise')
-    save_path : str, optional
-        Path to save the figure. If None, displays the plot.
-    """
-    # Filter for specific approx_type
-    subset = results_df[results_df['approx_type'] == approx_type].copy()
-    
-    if len(subset) == 0:
-        print(f"No data found for approx_type='{approx_type}'")
-        return
-    
-    # Get unique data types and sort them
-    data_types = sorted(subset['data_type'].unique())
-    n_types = len(data_types)
-    
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Define colors for each data type
-    colors = {'heaviside': '#2E86AB', 'hill': '#A23B72', 'piecewise': '#F18F01'}
-    
-    for param_idx, param_name in enumerate(['param_0', 'param_1']):
-        ax = axes[param_idx]
-        
-        for i, data_type in enumerate(data_types):
-            # Get data for this data_type
-            data = subset[subset['data_type'] == data_type][param_name].values
-            
-            # Add jitter to x-position for visibility
-            n_points = len(data)
-            jitter = np.random.uniform(-0.15, 0.15, n_points)
-            x_pos = np.ones(n_points) * i + jitter
-            
-            # Plot individual runs
-            color = colors.get(data_type, 'gray')
-            ax.scatter(x_pos, data, alpha=0.5, s=50, color=color, 
-                      edgecolors='black', linewidth=0.5, label=f'{data_type} (runs)')
-            
-            # Compute and plot mean and std
-            mean_val = data.mean()
-            std_val = data.std()
-            
-            # Mean as larger diamond
-            ax.scatter([i], [mean_val], marker='D', s=200, color=color,
-                      edgecolors='black', linewidth=2, zorder=10,
-                      label=f'{data_type} ($\\mu$={mean_val:.2f})')
-            
-            # Std as error bar
-            ax.errorbar([i], [mean_val], yerr=[std_val], fmt='none',
-                       ecolor='black', capsize=8, capthick=2, linewidth=2, zorder=9)
-        
-        # Formatting - create labels with ground truth parameters
-        label_map = {
-            'heaviside': 'heaviside',
-            'hill': 'hill (n=10)',
-            'piecewise': 'piecewise (h=1.0)'
-        }
-        x_labels = [label_map.get(dt, dt) for dt in data_types]
-        
-        ax.set_xticks(range(n_types))
-        ax.set_xticklabels(x_labels, fontsize=11)
-        ax.set_ylabel('Parameter Value', fontsize=12)
-        ax.set_title(f'{param_name}', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.set_xlim(-0.5, n_types - 0.5)
-        
-        # Legend - only show mean values to avoid clutter
-        handles, labels = ax.get_legend_handles_labels()
-        # Keep only the mean (diamond) entries
-        mean_handles = [h for h, l in zip(handles, labels) if '$\\mu$=' in l]
-        mean_labels = [l for l in labels if '$\\mu$=' in l]
-        ax.legend(mean_handles, mean_labels, loc='best', fontsize=9)
-    
-    plt.suptitle(f'Learned Parameters - {approx_type.capitalize()} Approximation', 
-                 fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-    else:
-        plt.show()
-
-
-
-def plot_all_training_curves(
-    data_type: str,
-    approx_type: str,
-    results_dir: str = 'results/training_curves',
-    save_path: str = None
-):
-    """
-    Plot all training curves for a specific (data_type, approx_type) combination.
-
-    Creates a 1x3 subplot figure showing:
-    - Left: Training loss vs epoch
-    - Middle: param_0 vs epoch
-    - Right: param_1 vs epoch
-
-    All runs (typically 20) are shown as semi-transparent lines.
-
-    Parameters
-    ----------
-    data_type : str
-        Data type ('heaviside', 'hill', or 'piecewise')
-    approx_type : str
-        Approximation type ('hill' or 'piecewise')
-    results_dir : str
-        Path to directory containing training curve CSV files
-    save_path : str, optional
-        Path to save the figure. If None, displays the plot.
-    """
-    from pathlib import Path
-    
-    # Collect all curve files for this specific combination
-    curves_path = Path(results_dir)
-    pattern = f"{data_type}_{approx_type}_run*.csv"
-    curve_files = sorted(curves_path.glob(pattern))
-    
-    if len(curve_files) == 0:
-        print(f"No training curve files found matching {pattern} in {results_dir}")
-        return
-    
-    print(f"Loading {len(curve_files)} training curves for {data_type}/{approx_type}...")
-    
-    # Load all data
-    all_dfs = []
-    for file_path in curve_files:
-        df = pd.read_csv(file_path)
-        all_dfs.append(df)
-    
-    # Create figure with 3 subplots
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # Define color based on data type
-    color_map = {
-        'heaviside': '#2E86AB',
-        'hill': '#A23B72',
-        'piecewise': '#F18F01'
-    }
-    color = color_map.get(data_type, 'gray')
-    
-    # Plot all runs
-    for i, df in enumerate(all_dfs):
-        # Loss plot
-        axes[0].semilogy(df['epoch'], df['loss_total'], 
-                       color=color, alpha=0.4, linewidth=1.5)
-        
-        # param_0 plot
-        axes[1].plot(df['epoch'], df['param_0'],
-                    color=color, alpha=0.4, linewidth=1.5)
-        
-        # param_1 plot
-        axes[2].plot(df['epoch'], df['param_1'],
-                    color=color, alpha=0.4, linewidth=1.5)
-    
-    # Format loss subplot
-    axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Training Loss (log scale)', fontsize=12)
-    axes[0].set_title('Training Loss Evolution', fontsize=14, fontweight='bold')
-    axes[0].grid(True, alpha=0.3)
-    
-    # Format param_0 subplot
-    axes[1].set_xlabel('Epoch', fontsize=12)
-    axes[1].set_ylabel('param_0 Value', fontsize=12)
-    axes[1].set_title('param_0 Evolution', fontsize=14, fontweight='bold')
-    axes[1].grid(True, alpha=0.3)
-    
-    # Format param_1 subplot
-    axes[2].set_xlabel('Epoch', fontsize=12)
-    axes[2].set_ylabel('param_1 Value', fontsize=12)
-    axes[2].set_title('param_1 Evolution', fontsize=14, fontweight='bold')
-    axes[2].grid(True, alpha=0.3)
-    
-    # Create title with ground truth info
-    if data_type == 'hill':
-        data_label = f'{data_type} (n=10)'
-    elif data_type == 'piecewise':
-        data_label = f'{data_type} (h=1.0)'
-    else:
-        data_label = data_type
-    
-    title = f'Training Curves: {data_label} data → {approx_type} approximation ({len(all_dfs)} runs)'
-    plt.suptitle(title, fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Saved to: {save_path}")
-    else:
-        plt.show()
-
-
-def compute_confidence_intervals(results_df: pd.DataFrame) -> pd.DataFrame:
-    r"""
-    Compute \mu \pm \sigma confidence intervals for each (data_type, approx_type) group.
-
-    Groups the results by data_type and approx_type, then computes summary
-    statistics including means, standard deviations, confidence interval bounds,
-    number of runs, and loss statistics.
-
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Results dataframe with columns: ['data_type', 'approx_type', 'param_0',
-        'param_1', 'final_loss', ...]
-
-    Returns
-    -------
-    pd.DataFrame
-        Summary dataframe with columns:
-        - data_type, approx_type: grouping keys
-        - param_0_mean, param_0_std: mean and std of param_0
-        - param_0_ci_lower, param_0_ci_upper: mu - sigma and mu + sigma bounds
-        - param_1_mean, param_1_std: mean and std of param_1
-        - param_1_ci_lower, param_1_ci_upper: mu - sigma and mu + sigma bounds
-        - n_runs: number of runs in the group
-        - mean_final_loss, std_final_loss: statistics of final loss
-    """
-    summary = []
-
-    for (data_type, approx_type), group in results_df.groupby(['data_type', 'approx_type']):
-        mu0, sigma0 = group['param_0'].mean(), group['param_0'].std()
-        mu1, sigma1 = group['param_1'].mean(), group['param_1'].std()
-
-        summary.append({
-            'data_type': data_type,
-            'approx_type': approx_type,
-            'param_0_mean': mu0,
-            'param_0_std': sigma0,
-            'param_0_ci_lower': mu0 - sigma0,
-            'param_0_ci_upper': mu0 + sigma0,
-            'param_1_mean': mu1,
-            'param_1_std': sigma1,
-            'param_1_ci_lower': mu1 - sigma1,
-            'param_1_ci_upper': mu1 + sigma1,
-            'n_runs': len(group),
-            'mean_final_loss': group['final_loss'].mean(),
-            'std_final_loss': group['final_loss'].std()
-        })
-
-    return pd.DataFrame(summary)

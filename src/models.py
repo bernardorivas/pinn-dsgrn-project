@@ -1,330 +1,253 @@
 """
-Models module for PINN discontinuous ODE steepness learning.
+PINN models for DSGRN regulatory network parameter recovery.
 
 Implements:
 1. Sine: Sinusoidal activation function
 2. SIREN: Sinusoidal Representation Network
-3. DiscontinuousPINN: Physics-informed neural network for learning ODE steepness
+3. DSGRNPinn: Physics-informed neural network for learning L, U, T, d per edge
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
 
+from network_parser import NetworkTopology
+from ode_builder import compute_rhs_torch
+
 
 class Sine(nn.Module):
-    """
-    Sinusoidal activation function.
-
-    Applies sin(omega0 * x) as an activation function, which is beneficial for
-    learning high-frequency features (like discontinuities) in coordinate-based
-    neural networks.
-
-    Args:
-        omega0: Frequency multiplier for the sine function (default 30.0)
-    """
+    """Sinusoidal activation: sin(omega0 * x)."""
 
     def __init__(self, omega0: float = 30.0):
         super().__init__()
         self.omega0 = omega0
 
     def forward(self, x):
-        """Apply sinusoidal activation."""
         return torch.sin(self.omega0 * x)
 
 
 class SIREN(nn.Module):
     """
-    Sinusoidal Representation Network (SIREN).
+    Sinusoidal Representation Network.
 
-    A periodic activation network designed for coordinate-based learning tasks.
-    Uses sine activations throughout the network to enable learning of high-frequency
-    features, making it well-suited for approximating discontinuities and sharp
-    transitions in ODEs.
-
-    Reference:
-        Sitzmann, V., Martel, J., Bergman, A., Lindell, D., & Wetzstein, G. (2020).
-        Implicit neural representations with levels of experts.
+    Uses sine activations throughout for learning high-frequency features.
 
     Args:
-        in_dim: Input dimension (e.g., 3 for [t, ic0, ic1])
-        out_dim: Output dimension (e.g., 2 for [x0, x1])
-        hidden_dim: Number of hidden units per layer (default 64)
-        n_layers: Number of hidden layers (default 4)
-        omega0: Frequency parameter for sine activations (default 30.0)
+        in_dim: input dimension
+        out_dim: output dimension
+        hidden_dim: hidden units per layer
+        n_layers: number of hidden layers
+        omega0: frequency parameter for sine activations
     """
 
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        hidden_dim: int = 64,
-        n_layers: int = 4,
-        omega0: float = 30.0
-    ):
+    def __init__(self, in_dim, out_dim, hidden_dim=64, n_layers=4, omega0=30.0):
         super().__init__()
-
-        # Build network layers
         layers = []
         dims = [in_dim] + [hidden_dim] * n_layers + [out_dim]
-
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:  # All but last layer get sine activation
+            if i < len(dims) - 2:
                 layers.append(Sine(omega0))
-
         self.net = nn.Sequential(*layers)
         self._init_weights(omega0)
 
     def _init_weights(self, omega0):
-        """
-        Initialize weights according to SIREN paper specifications.
-
-        For the first layer, weights are uniformly distributed in [-1/n_in, 1/n_in].
-        For subsequent layers, weights are uniformly distributed in
-        [-sqrt(6/n_in)/omega0, sqrt(6/n_in)/omega0].
-
-        Args:
-            omega0: Frequency parameter (used for scaling subsequent layers)
-        """
         with torch.no_grad():
             for i, layer in enumerate(self.net):
                 if isinstance(layer, nn.Linear):
-                    num_input = layer.weight.size(1)
+                    n_in = layer.weight.size(1)
                     if i == 0:
-                        # First layer initialization
-                        layer.weight.uniform_(-1 / num_input, 1 / num_input)
+                        layer.weight.uniform_(-1 / n_in, 1 / n_in)
                     else:
-                        # Subsequent layers (non-first)
-                        bound = np.sqrt(6 / num_input) / omega0
+                        bound = np.sqrt(6 / n_in) / omega0
                         layer.weight.uniform_(-bound, bound)
 
     def forward(self, x):
-        """Forward pass through the SIREN network."""
         return self.net(x)
 
 
-class DiscontinuousPINN(nn.Module):
+class DSGRNPinn(nn.Module):
     """
-    Physics-informed neural network
+    Physics-informed neural network for DSGRN regulatory network parameter recovery.
 
-    This network learns to approximate the solution of a 2D ODE system while also
-    learning the steepness parameters (Hill exponent n or piecewise width h) of
-    smooth approximations to Heaviside step functions.
-
-    The network architecture:
-    - Input: (t, ic0, ic1) where t is time and ic are initial conditions
-    - Output: (x0, x1) predicted state values
-    - Uses SIREN with sine activations for high-frequency features
-
-    The ODE system is:
-        x0' = -x0 + U[0] + H(T[0] - x1) * (L[0] - U[0])
-        x1' = -x1 + U[1] + H(T[1] - x0) * (L[1] - U[1])
-
-    Where H(·) is approximated by either a Hill function or piecewise linear ramp.
+    Learns per-edge parameters L, U, T, d (Hill exponent) from trajectory data.
+    Uses reparameterization to enforce 0 < L < T < U.
 
     Args:
-        hidden_dim: Number of hidden units per layer (default 64)
-        n_layers: Number of hidden layers (default 4)
-        omega0: Frequency parameter for SIREN (default 30.0)
-        U: Steady-state values when Heaviside = 0 (default (5.0, 5.0))
-        L: Steady-state values when Heaviside = 1 (default (1.0, 1.0))
-        T: Threshold values for Heaviside terms (default (3.0, 3.0))
-        approx_type: Type of approximation ('hill' or 'piecewise', default 'hill')
-        init_steepness: Initial value for steepness parameter (default 4.0)
-            - For Hill: initial n value
-            - For piecewise: initial 1/h value
+        topology: NetworkTopology defining the network structure
+        gamma: decay rates per node (fixed, not learned)
+        hidden_dim: SIREN hidden units
+        n_layers: SIREN hidden layers
+        omega0: SIREN frequency
+        approx_type: 'hill' or 'ramp'
+        init_steepness: initial Hill exponent / ramp width
+        init_L, init_U, init_T: optional 2D arrays for parameter initialization
     """
 
     def __init__(
         self,
+        topology: NetworkTopology,
+        gamma,
         hidden_dim: int = 64,
         n_layers: int = 4,
         omega0: float = 30.0,
-        U: tuple = (5.0, 5.0),
-        L: tuple = (1.0, 1.0),
-        T: tuple = (3.0, 3.0),
         approx_type: str = 'hill',
-        init_steepness: float = 4.0
+        init_steepness: float = 4.0,
+        init_L=None,
+        init_U=None,
+        init_T=None,
     ):
         super().__init__()
+        self.topology = topology
+        self.approx_type = approx_type
+        n_nodes = topology.n_nodes
+        n_edges = topology.n_edges
 
-        # SIREN network: (t, ic0, ic1) -> (x0, x1)
+        # SIREN: (t, ic0, ..., ic_{n-1}) -> (x0, ..., x_{n-1})
         self.net = SIREN(
-            in_dim=3,        # time + 2 initial conditions
-            out_dim=2,       # x0, x1
+            in_dim=1 + n_nodes,
+            out_dim=n_nodes,
             hidden_dim=hidden_dim,
             n_layers=n_layers,
-            omega0=omega0
+            omega0=omega0,
         )
 
-        # ODE parameters (fixed, not learned)
-        self.register_buffer('U', torch.tensor(U, dtype=torch.float32))
-        self.register_buffer('L', torch.tensor(L, dtype=torch.float32))
-        self.register_buffer('T', torch.tensor(T, dtype=torch.float32))
+        # Gamma: fixed decay rates
+        self.register_buffer('gamma', torch.tensor(gamma, dtype=torch.float32))
 
-        # Learnable steepness parameters
-        self.approx_type = approx_type
-        if approx_type == 'hill':
-            # For Hill approximation: learn n (Hill exponent) for each term
-            # Log-parameterized for positivity constraint
-            self.log_steepness = nn.Parameter(
-                torch.log(torch.tensor([init_steepness, init_steepness], dtype=torch.float32))
-            )
-        elif approx_type == 'piecewise':
-            # For piecewise approximation: learn h (half-width) for each term
-            # Parameterized as 1/h initially, then log-transformed
-            self.log_steepness = nn.Parameter(
-                torch.log(torch.tensor([1.0 / init_steepness, 1.0 / init_steepness], dtype=torch.float32))
-            )
+        # Precompute edge index tensors for _scatter_to_matrix
+        src_idx = [e[0] for e in topology.edge_list]
+        tgt_idx = [e[1] for e in topology.edge_list]
+        self.register_buffer('_edge_src', torch.tensor(src_idx, dtype=torch.long))
+        self.register_buffer('_edge_tgt', torch.tensor(tgt_idx, dtype=torch.long))
+
+        # Per-edge parameter initialization
+        if init_L is not None:
+            init_L = np.asarray(init_L)
+            init_T_arr = np.asarray(init_T)
+            init_U = np.asarray(init_U)
+            L_flat = np.array([init_L[s, t] for s, t in topology.edge_list])
+            T_flat = np.array([init_T_arr[s, t] for s, t in topology.edge_list])
+            U_flat = np.array([init_U[s, t] for s, t in topology.edge_list])
         else:
-            raise ValueError(f"Unknown approx_type: {approx_type}. Must be 'hill' or 'piecewise'.")
+            L_flat = np.ones(n_edges) * 1.0
+            T_flat = np.ones(n_edges) * 2.0
+            U_flat = np.ones(n_edges) * 3.0
 
-    def get_steepness_params(self):
-        """
-        Get current steepness parameters.
+        # Reparameterization: L = exp(log_L), T = L + exp(log_dTL), U = T + exp(log_dUT)
+        L_flat_safe = np.maximum(L_flat, 1e-3)
+        delta_TL = np.maximum(T_flat - L_flat_safe, 1e-6)
+        delta_UT = np.maximum(U_flat - T_flat, 1e-6)
 
-        Returns:
-            torch.Tensor: Steepness values [param_0, param_1]
-                - For Hill: returns n values
-                - For piecewise: returns h values
-        """
-        return torch.exp(self.log_steepness)
-
-    def hill_approx(self, x, theta, n):
-        """
-        Hill function approximation of H(theta - x).
-
-        Computes: theta^n / (theta^n + x^n)
-
-        This smooth approximation to the Heaviside step H(theta - x) is symmetric
-        around x = theta and has steepness controlled by exponent n.
-
-        Args:
-            x: Input value(s)
-            theta: Threshold parameter
-            n: Hill exponent (controls steepness)
-
-        Returns:
-            Approximation of H(theta - x) in [0, 1]
-        """
-        eps = 1e-12  # Numerical stability
-        x_pos = torch.clamp(x, min=eps)
-        theta_n = theta ** n
-        x_n = x_pos ** n
-        return theta_n / (theta_n + x_n)
-
-    def piecewise_approx(self, x, theta, h):
-        """
-        Piecewise linear ramp approximation of H(theta - x).
-
-        Implements a linear transition region:
-        - Returns 1.0 for x <= theta - h
-        - Linear interpolation for theta - h < x < theta + h
-        - Returns 0.0 for x >= theta + h
-
-        The transition region has width 2h, allowing flexible learning of the
-        steepness.
-
-        Args:
-            x: Input value(s)
-            theta: Center of transition region
-            h: Half-width of transition (total width = 2h)
-
-        Returns:
-            Piecewise linear approximation of H(theta - x) in [0, 1]
-        """
-        left = theta - h
-        right = theta + h
-
-        # Linear interpolation in [left, right]
-        slope = -1.0 / (2.0 * h + 1e-12)  # Ensure non-zero denominator
-        linear = 1.0 + slope * (x - left)
-
-        return torch.where(
-            x <= left,
-            torch.ones_like(x),
-            torch.where(x >= right, torch.zeros_like(x), linear)
+        self.log_L = nn.Parameter(
+            torch.log(torch.tensor(L_flat_safe, dtype=torch.float32))
         )
+        self.log_delta_TL = nn.Parameter(
+            torch.log(torch.tensor(delta_TL, dtype=torch.float32))
+        )
+        self.log_delta_UT = nn.Parameter(
+            torch.log(torch.tensor(delta_UT, dtype=torch.float32))
+        )
+
+        # Per-edge steepness (Hill exponent d or ramp width h)
+        self.log_d = nn.Parameter(
+            torch.log(torch.tensor([init_steepness] * n_edges, dtype=torch.float32))
+        )
+
+    # -- Parameter accessors --
+
+    def _get_params(self):
+        """Compute all flat parameter tensors once (avoids redundant exp calls)."""
+        L = torch.exp(self.log_L)
+        T = L + torch.exp(self.log_delta_TL)
+        U = T + torch.exp(self.log_delta_UT)
+        d = torch.exp(self.log_d)
+        return L, T, U, d
+
+    def _scatter_to_matrix(self, flat):
+        """Map flat (n_edges,) tensor to (n_nodes, n_nodes) matrix."""
+        n = self.topology.n_nodes
+        mat = torch.zeros(n, n, device=flat.device, dtype=flat.dtype)
+        mat[self._edge_src, self._edge_tgt] = flat
+        return mat
+
+    def get_learned_params(self):
+        """Return learned parameters as numpy 2D arrays."""
+        with torch.no_grad():
+            L, T, U, d = self._get_params()
+            return {
+                'L': self._scatter_to_matrix(L).cpu().numpy(),
+                'U': self._scatter_to_matrix(U).cpu().numpy(),
+                'T': self._scatter_to_matrix(T).cpu().numpy(),
+                'd': self._scatter_to_matrix(d).cpu().numpy(),
+            }
+
+    def get_learned_params_flat(self):
+        """Return learned parameters as flat numpy arrays (one value per edge)."""
+        with torch.no_grad():
+            L, T, U, d = self._get_params()
+            return {
+                'L': L.cpu().numpy(),
+                'U': U.cpu().numpy(),
+                'T': T.cpu().numpy(),
+                'd': d.cpu().numpy(),
+            }
+
+    # -- Forward / physics --
 
     def forward(self, t, ic):
         """
-        Forward pass: predict state from time and initial conditions.
+        Predict states from time and initial conditions.
 
         Args:
-            t: (N, 1) tensor of time points
-            ic: (N, 2) tensor of initial conditions [ic0, ic1]
+            t: (N, 1)
+            ic: (N, n_nodes)
 
         Returns:
-            x_pred: (N, 2) tensor of predicted states [x0, x1]
+            (N, n_nodes) predicted states
         """
-        # Concatenate inputs: [t, ic0, ic1]
         inputs = torch.cat([t, ic], dim=1)
+        return self.net(inputs)
 
-        # Neural network prediction
-        x_pred = self.net(inputs)
-
-        return x_pred
-
-    def compute_physics_residual(self, t, ic, x_pred):
+    def compute_physics_residual(self, t, ic, x_pred=None):
         """
-        Compute ODE physics residual: dx/dt - f(x, t).
-
-        This method computes the residual of the ODE system by:
-        1. Computing time derivatives via automatic differentiation
-        2. Evaluating the ODE right-hand side at predicted states
-        3. Computing the difference (residual)
-
-        The residual should be zero when the predictions satisfy the ODE.
+        Compute ODE residual: dx/dt - f(x).
 
         Args:
-            t: (N, 1) tensor of time points
-            ic: (N, 2) tensor of initial conditions
-            x_pred: (N, 2) tensor of predicted states (from forward pass)
+            t: (N, 1) time tensor
+            ic: (N, n_nodes) initial condition tensor
+            x_pred: unused, kept for API compatibility
 
         Returns:
-            residual: (N, 2) tensor of ODE residuals [r0, r1]
-                where r0 = dx0/dt - f0(x0, x1) and r1 = dx1/dt - f1(x0, x1)
+            (N, n_nodes) tensor of residuals
         """
-        # Enable gradient tracking for time derivative computation
+        n_nodes = self.topology.n_nodes
+
+        # Forward pass with fresh autograd tape on t
         t_ad = t.clone().requires_grad_(True)
         inputs = torch.cat([t_ad, ic], dim=1)
         x = self.net(inputs)
 
-        # Compute time derivatives using automatic differentiation
-        dx0_dt = torch.autograd.grad(
-            x[:, 0].sum(), t_ad,
-            create_graph=True, retain_graph=True
-        )[0]
-        dx1_dt = torch.autograd.grad(
-            x[:, 1].sum(), t_ad,
-            create_graph=True, retain_graph=True
-        )[0]
+        # Time derivatives via autograd
+        dx_dt_parts = []
+        for i in range(n_nodes):
+            dx_i = torch.autograd.grad(
+                x[:, i].sum(), t_ad,
+                create_graph=True, retain_graph=True
+            )[0]
+            dx_dt_parts.append(dx_i)
+        dx_dt = torch.cat(dx_dt_parts, dim=1)
 
-        # Extract states (maintain shape for broadcasting)
-        x0, x1 = x[:, 0:1], x[:, 1:2]
+        # Reconstruct parameter matrices (single computation)
+        L_flat, T_flat, U_flat, d_flat = self._get_params()
+        L = self._scatter_to_matrix(L_flat)
+        U = self._scatter_to_matrix(U_flat)
+        T = self._scatter_to_matrix(T_flat)
+        d = self._scatter_to_matrix(d_flat)
 
-        # Get steepness parameters
-        params = self.get_steepness_params()
+        # ODE right-hand side
+        rhs = compute_rhs_torch(
+            self.topology, x, L, U, T, self.gamma, self.approx_type, d
+        )
 
-        # Compute approximate Heaviside terms based on approximation type
-        if self.approx_type == 'hill':
-            # Hill approximation: H(T[0] - x1) and H(T[1] - x0)
-            h_01 = self.hill_approx(x1, self.T[0], params[0])
-            h_10 = self.hill_approx(x0, self.T[1], params[1])
-        elif self.approx_type == 'piecewise':
-            # Piecewise linear approximation
-            h_01 = self.piecewise_approx(x1, self.T[0], params[0])
-            h_10 = self.piecewise_approx(x0, self.T[1], params[1])
-        else:
-            raise ValueError(f"Unknown approx_type: {self.approx_type}")
-
-        # Right-hand side of ODE: dx/dt = f(x)
-        rhs_x0 = -x0 + self.U[0] + h_01 * (self.L[0] - self.U[0])
-        rhs_x1 = -x1 + self.U[1] + h_10 * (self.L[1] - self.U[1])
-
-        # Residual: dx/dt - rhs
-        residual_x0 = dx0_dt - rhs_x0
-        residual_x1 = dx1_dt - rhs_x1
-
-        return torch.cat([residual_x0, residual_x1], dim=1)
+        return dx_dt - rhs

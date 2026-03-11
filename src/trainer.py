@@ -1,171 +1,129 @@
 """
-Training module for PINN discontinuous ODE steepness learning.
+Training module for DSGRN PINN parameter recovery.
 
-Implements:
-1. compute_losses: Combined loss function (data + physics + IC)
-2. train_pinn: Main training loop with early stopping
+Implements the training loop with early stopping, loss computation,
+and dynamic parameter tracking for variable-size networks.
 """
 
 import torch
 import pandas as pd
 import numpy as np
-from models import DiscontinuousPINN
+from typing import Optional
 
 
-def compute_losses(
-    model: DiscontinuousPINN,
-    t: torch.Tensor,
-    ic: torch.Tensor,
-    x_true: torch.Tensor,
-    loss_weights: dict
-) -> tuple[torch.Tensor, dict]:
+def compute_losses(model, t, ic, x_true, loss_weights):
     """
-    Compute combined loss function for PINN training.
-
-    Combines three loss components:
-    1. Data loss: MSE between predicted and ground truth states
-    2. Physics loss: MSE of ODE residual (enforces physics constraints)
-    3. IC loss: Soft constraint that predictions match initial conditions at t≈0
+    Compute combined PINN loss (data + physics + IC).
 
     Args:
-        model: DiscontinuousPINN model instance
-        t: (N, 1) tensor of time points
-        ic: (N, 2) tensor of initial conditions [ic0, ic1]
-        x_true: (N, 2) tensor of ground truth states [x0, x1]
-        loss_weights: dict with keys 'data', 'physics', 'ic' specifying loss weights
+        model: nn.Module with forward() and compute_physics_residual()
+        t: (N, 1) time tensor
+        ic: (N, n_nodes) initial condition tensor
+        x_true: (N, n_nodes) ground truth state tensor
+        loss_weights: dict with keys 'data', 'physics', 'ic'
 
     Returns:
-        total_loss: (scalar) weighted combination of all loss components
-        loss_dict: dict with keys 'data', 'physics', 'ic' containing individual loss values
+        (total_loss, loss_dict)
     """
-    # Forward pass: predict states
     x_pred = model(t, ic)
 
-    # 1. Data loss: MSE between prediction and ground truth
     loss_data = torch.mean((x_pred - x_true) ** 2)
 
-    # 2. Physics loss: ODE residual
     residual = model.compute_physics_residual(t, ic, x_pred)
     loss_physics = torch.mean(residual ** 2)
 
-    # 3. Initial condition loss (soft constraint)
-    # Find points at t=0 (or very close: t <= t.min() + 1e-6)
     t0_mask = (t <= t.min() + 1e-6).squeeze()
     if t0_mask.any():
-        ic_pred = x_pred[t0_mask]
-        ic_target = ic[t0_mask]
-        loss_ic = torch.mean((ic_pred - ic_target) ** 2)
+        loss_ic = torch.mean((x_pred[t0_mask] - ic[t0_mask]) ** 2)
     else:
         loss_ic = torch.tensor(0.0, device=t.device)
 
-    # Total weighted loss
     total_loss = (
-        loss_weights['data'] * loss_data +
-        loss_weights['physics'] * loss_physics +
-        loss_weights['ic'] * loss_ic
+        loss_weights['data'] * loss_data
+        + loss_weights['physics'] * loss_physics
+        + loss_weights['ic'] * loss_ic
     )
 
     loss_dict = {
         'data': loss_data.item(),
         'physics': loss_physics.item(),
-        'ic': loss_ic.item()
+        'ic': loss_ic.item(),
     }
-
     return total_loss, loss_dict
 
 
 def train_pinn(
-    model: DiscontinuousPINN,
+    model,
     data: pd.DataFrame,
     device: str = 'mps',
-    max_epochs: int = 10000,
+    max_epochs: int = 20000,
     lr: float = 1e-3,
-    patience: int = 500,
-    log_interval: int = 100,
-    loss_weights: dict = None,
-    save_history: bool = True
+    patience: int = 1000,
+    log_interval: int = 200,
+    loss_weights: Optional[dict] = None,
+    save_history: bool = True,
 ) -> dict:
     """
-    Train PINN model with early stopping.
-
-    Implements the main training loop for the Physics-Informed Neural Network,
-    including loss computation, backpropagation, early stopping, and history tracking.
+    Train a DSGRNPinn model with early stopping.
 
     Args:
-        model: DiscontinuousPINN model to train
-        data: pandas DataFrame with columns ['t', 'ic0', 'ic1', 'x0', 'x1']
-        device: Device to train on ('mps', 'cuda', or 'cpu', default 'mps')
-        max_epochs: Maximum number of training epochs (default 10000)
-        lr: Learning rate for Adam optimizer (default 1e-3)
-        patience: Early stopping patience (stop if no improvement for this many epochs, default 500)
-        log_interval: Interval for printing training progress (default 100)
-        loss_weights: dict with keys 'data', 'physics', 'ic' for loss weighting.
-                     If None, defaults to {'data': 1.0, 'physics': 1.0, 'ic': 1.0}
-        save_history: If True, save training history; otherwise return None for history (default True)
+        model: DSGRNPinn instance
+        data: DataFrame with columns t, x0..x_{n-1}, ic0..ic_{n-1}
+        device: 'mps', 'cuda', or 'cpu'
+        max_epochs: maximum training epochs
+        lr: learning rate
+        patience: early stopping patience
+        log_interval: print interval
+        loss_weights: loss component weights
+        save_history: whether to record training history
 
     Returns:
-        dict with keys:
-            - 'final_loss': float, best loss achieved during training
-            - 'final_params': np.ndarray, shape (2,), learned steepness parameters [param_0, param_1]
-            - 'converged_epoch': int, epoch at which best loss was achieved
-            - 'history': dict with training history (if save_history=True, else None)
-                Keys: 'epoch', 'loss_total', 'loss_data', 'loss_physics', 'loss_ic', 'param_0', 'param_1'
+        dict with: final_loss, final_params, converged_epoch,
+                   history, model_state
     """
-    # Set default loss weights
     if loss_weights is None:
         loss_weights = {'data': 1.0, 'physics': 1.0, 'ic': 1.0}
 
-    # Move model to device
+    n_nodes = model.topology.n_nodes
+    edge_list = model.topology.edge_list
+
     model = model.to(device)
 
-    # Prepare data tensors
-    t = torch.tensor(data['t'].values, dtype=torch.float32).reshape(-1, 1).to(device)
-    ic = torch.tensor(
-        data[['ic0', 'ic1']].values,
-        dtype=torch.float32
-    ).to(device)
-    x_true = torch.tensor(
-        data[['x0', 'x1']].values,
-        dtype=torch.float32
-    ).to(device)
+    # Prepare tensors
+    x_cols = [f'x{i}' for i in range(n_nodes)]
+    ic_cols = [f'ic{i}' for i in range(n_nodes)]
 
-    # Create optimizer
+    t = torch.tensor(data['t'].values, dtype=torch.float32).reshape(-1, 1).to(device)
+    ic = torch.tensor(data[ic_cols].values, dtype=torch.float32).to(device)
+    x_true = torch.tensor(data[x_cols].values, dtype=torch.float32).to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Initialize training history
-    history = {
-        'epoch': [],
-        'loss_total': [],
-        'loss_data': [],
-        'loss_physics': [],
-        'loss_ic': [],
-        'param_0': [],
-        'param_1': []
-    }
+    # Build history keys
+    param_keys = []
+    for prefix in ('L', 'U', 'T', 'd'):
+        for s, tgt in edge_list:
+            param_keys.append(f'{prefix}_{s}_{tgt}')
 
-    # Early stopping variables
+    history = {'epoch': [], 'loss_total': [], 'loss_data': [],
+               'loss_physics': [], 'loss_ic': []}
+    for k in param_keys:
+        history[k] = []
+
     best_loss = float('inf')
     patience_counter = 0
     best_state = None
 
-    # Training loop
     for epoch in range(max_epochs):
         model.train()
         optimizer.zero_grad()
 
-        # Compute loss
-        total_loss, loss_dict = compute_losses(
-            model, t, ic, x_true, loss_weights
-        )
-
-        # Backward pass
+        total_loss, loss_dict = compute_losses(model, t, ic, x_true, loss_weights)
         total_loss.backward()
         optimizer.step()
 
-        # Get current steepness parameters
-        current_params = model.get_steepness_params().detach().cpu().numpy()
+        params_flat = model.get_learned_params_flat()
 
-        # Logging every log_interval epochs
         if epoch % log_interval == 0:
             print(
                 f"Epoch {epoch:5d} | "
@@ -173,49 +131,51 @@ def train_pinn(
                 f"Data: {loss_dict['data']:.4e} | "
                 f"Phys: {loss_dict['physics']:.4e} | "
                 f"IC: {loss_dict['ic']:.4e} | "
-                f"Params: [{current_params[0]:.3f}, {current_params[1]:.3f}]"
+                f"L: {np.round(params_flat['L'], 3)} | "
+                f"U: {np.round(params_flat['U'], 3)} | "
+                f"T: {np.round(params_flat['T'], 3)} | "
+                f"d: {np.round(params_flat['d'], 3)}"
             )
 
-        # Save history (only if save_history=True)
         if save_history:
             history['epoch'].append(epoch)
             history['loss_total'].append(total_loss.item())
             history['loss_data'].append(loss_dict['data'])
             history['loss_physics'].append(loss_dict['physics'])
             history['loss_ic'].append(loss_dict['ic'])
-            history['param_0'].append(current_params[0])
-            history['param_1'].append(current_params[1])
+            for prefix in ('L', 'U', 'T', 'd'):
+                for i, (s, tgt) in enumerate(edge_list):
+                    history[f'{prefix}_{s}_{tgt}'].append(
+                        float(params_flat[prefix][i])
+                    )
 
-        # Early stopping check
         if total_loss.item() < best_loss:
             best_loss = total_loss.item()
             patience_counter = 0
             best_state = {
                 'epoch': epoch,
-                'model_state': model.state_dict(),
-                'params': current_params.copy()
+                'model_state': {k: v.clone() for k, v in model.state_dict().items()},
+                'params': model.get_learned_params(),
             }
         else:
             patience_counter += 1
 
-        # Stop if patience exceeded
         if patience_counter >= patience:
             print(f"Early stopping at epoch {epoch}")
             break
 
-    # Load best model state
     if best_state is not None:
         model.load_state_dict(best_state['model_state'])
         final_params = best_state['params']
         converged_epoch = best_state['epoch']
     else:
-        # Fallback: use current params (should not happen in practice)
-        final_params = current_params.copy()
+        final_params = model.get_learned_params()
         converged_epoch = epoch
 
     return {
         'final_loss': best_loss,
         'final_params': final_params,
         'converged_epoch': converged_epoch,
-        'history': history if save_history else None
+        'history': history if save_history else None,
+        'model_state': best_state['model_state'] if best_state else model.state_dict(),
     }

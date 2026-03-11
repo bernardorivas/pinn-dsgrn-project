@@ -1,1 +1,1 @@
-# PINN for learning steepness in discontinuous ODEs
+# DSGRN-driven PINN for regulatory network parameter recovery

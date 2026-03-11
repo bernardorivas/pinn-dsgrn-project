@@ -1,170 +1,294 @@
 """
-Experiment module.
+Two-pipeline experiment runner for DSGRN PINN parameter recovery.
 
-Implements the main pipeline:
-- Loads configuration from YAML
-- Generates or loads training data
-- Runs full pipeline (3 data types x 2 approximation types x N runs)
-- Trains models and collects results
-- Computes and displays summary statistics
+Stage 1 (Data Generation): Generates trajectory data from known parameters,
+    produces before-training visualizations, saves student data package.
+Stage 2 (Parameter Recovery): Trains PINN(s) to recover L, U, T, d,
+    re-simulates with recovered parameters, compares via DSGRN.
 """
 
+import json
 import yaml
-from pathlib import Path
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
+from pathlib import Path
 from tqdm import tqdm
 
-from data_generator import generate_trajectories
-from models import DiscontinuousPINN
+from network_parser import parse_net_spec
+from data_generator import generate_trajectories, generate_ics_lhs
+from models import DSGRNPinn
 from trainer import train_pinn
+from dsgrn_interface import dsgrn_available, compute_parameter_index, compare_dynamics
+from utils import (
+    plot_initial_conditions,
+    plot_trajectories_timeseries,
+    plot_phase_portrait,
+    plot_trajectories_comparison,
+    plot_phase_portrait_comparison,
+    plot_parameter_comparison,
+    plot_training_curves,
+    plot_morse_graph_comparison,
+)
 
 
 def run_experiment_suite(config_path: str = 'configs/experiment_config.yaml'):
     """
-    Run full experimental suite:
-    - 3 data types × 2 approximation types × N runs
-
-    This function orchestrates the complete experimental workflow:
-    1. Loads configuration from YAML file
-    2. Creates output directories for results and figures
-    3. Generates or loads trajectory data for each data type
-    4. Trains PINN models with different approximation types and random seeds
-    5. Saves training histories and final results
-    6. Computes and displays summary statistics
-
-    Args:
-        config_path: Path to YAML configuration file
-                    (default 'configs/experiment_config.yaml')
+    Run the full two-stage experimental pipeline.
 
     Returns:
-        pd.DataFrame: Results dataframe with columns:
-            - data_type: Type of data ('heaviside', 'hill', 'piecewise')
-            - approx_type: Approximation type ('hill', 'piecewise')
-            - run_id: Run index (0 to n_runs-1)
-            - seed: Random seed used
-            - final_loss: Best loss achieved during training
-            - converged_epoch: Epoch at which best loss was achieved
-            - param_0: First learned steepness parameter
-            - param_1: Second learned steepness parameter
-            - param_mean: Mean of learned steepness parameters
-            - param_std: Standard deviation of learned steepness parameters
+        pd.DataFrame with summary results across all runs
     """
-    # Load config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Create output directories
-    results_dir = Path('results')
-    results_dir.mkdir(exist_ok=True)
-    (results_dir / 'training_curves').mkdir(exist_ok=True)
-    (results_dir / 'figures').mkdir(exist_ok=True)
+    topology = parse_net_spec(config['network']['net_spec'])
+    n_nodes = topology.n_nodes
 
-    # Generate or load data
-    data_dir = Path('data')
-    data_dir.mkdir(exist_ok=True)
+    L = np.array(config['parameters']['L'], dtype=np.float64)
+    U = np.array(config['parameters']['U'], dtype=np.float64)
+    T = np.array(config['parameters']['T'], dtype=np.float64)
+    gamma = np.array(config['parameters']['gamma'], dtype=np.float64)
 
-    data_types = ['heaviside', 'hill', 'piecewise']
-    approx_types = ['hill', 'piecewise']
-    n_runs = config['training']['n_runs']
+    dg = config['data_generation']
+    steepness = np.array(dg['steepness'], dtype=np.float64)
+    approx_type_data = dg['approx_type']
+
+    pinn_cfg = config['pinn']
+    train_cfg = config['training']
+    out_cfg = config['output']
+
+    exp_name = config.get('experiment_name', 'experiment')
+    base_dir = Path(out_cfg['results_dir']) / exp_name
+    before_dir = base_dir / 'before'
+    after_dir = base_dir / 'after'
+    before_dir.mkdir(parents=True, exist_ok=True)
+    after_dir.mkdir(parents=True, exist_ok=True)
+
+    # ==================================================================
+    # STAGE 1: DATA GENERATION
+    # ==================================================================
+    print("=" * 60)
+    print("STAGE 1: DATA GENERATION")
+    print("=" * 60)
+
+    # Save full config snapshot
+    with open(before_dir / 'config.yaml', 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+
+    # Ground truth DSGRN analysis
+    gt_index = -1
+    if dsgrn_available():
+        gt_index = compute_parameter_index(config['network']['net_spec'], L, U, T)
+        print(f"Ground truth DSGRN parameter index: {gt_index}")
+    (before_dir / 'par_index.txt').write_text(str(gt_index))
+
+    # Trapping box
+    box = topology.trapping_box(U, gamma)
+    print(f"Trapping box: {box}")
+    with open(before_dir / 'trapping_box.json', 'w') as f:
+        json.dump({'bounds': box.tolist()}, f, indent=2)
+
+    # Generate trajectories
+    data, ics = generate_trajectories(
+        topology=topology, L=L, U=U, T=T, gamma=gamma,
+        approx_type=approx_type_data, steepness=steepness,
+        n_traj=dg['n_traj'], t_span=tuple(dg['t_span']),
+        n_points=dg['n_points'], seed=dg['seed'],
+    )
+    data.to_csv(before_dir / 'trajectories.csv', index=False)
+    np.savetxt(before_dir / 'initial_conditions.csv', ics, delimiter=',',
+               header=','.join(f'ic{i}' for i in range(n_nodes)), comments='')
+    print(f"Generated {len(ics)} trajectories, {len(data)} data points")
+
+    # Before-training visualizations
+    if n_nodes == 2:
+        plot_initial_conditions(
+            ics, box, T=T,
+            save_path=str(before_dir / 'plot_initial_conditions.png'))
+        plot_trajectories_timeseries(
+            data, n_nodes=n_nodes,
+            save_path=str(before_dir / 'plot_timeseries.png'))
+        plot_phase_portrait(
+            topology, L, U, T, gamma, approx_type_data, steepness,
+            trajectories=data, ics=ics, trapping_box=box,
+            save_path=str(before_dir / 'plot_phase_portrait.png'))
+
+    # Student package
+    student_dir = before_dir / 'student_package'
+    student_dir.mkdir(exist_ok=True)
+    data.to_csv(student_dir / 'trajectories.csv', index=False)
+    with open(student_dir / 'network.yaml', 'w') as f:
+        yaml.dump({
+            'net_spec': config['network']['net_spec'],
+            'gamma': config['parameters']['gamma'],
+        }, f)
+
+    # ==================================================================
+    # STAGE 2: PARAMETER RECOVERY
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("STAGE 2: PARAMETER RECOVERY")
+    print("=" * 60)
+
+    n_runs = train_cfg['n_runs']
+    runs_dir = after_dir / 'runs'
+    runs_dir.mkdir(exist_ok=True)
 
     all_results = []
+    pbar = tqdm(total=n_runs, desc="Training runs")
 
-    # Progress tracking
-    total_experiments = len(data_types) * len(approx_types) * n_runs
-    pbar = tqdm(total=total_experiments, desc="Experiments")
+    for run_id in range(n_runs):
+        run_dir = runs_dir / f'run_{run_id:03d}'
+        run_dir.mkdir(exist_ok=True)
 
-    for data_type in data_types:
-        # Generate/load data
-        data_path = data_dir / f'{data_type}_trajectories.csv'
+        seed = train_cfg['base_seed'] + run_id
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-        if not data_path.exists():
-            print(f"Generating {data_type} data...")
-            data = generate_trajectories(
-                data_type=data_type,
-                **config['data_generation']
-            )
-            data.to_csv(data_path, index=False)
-        else:
-            data = pd.read_csv(data_path)
+        # Create model
+        model = DSGRNPinn(
+            topology=topology,
+            gamma=gamma.tolist(),
+            hidden_dim=pinn_cfg['hidden_dim'],
+            n_layers=pinn_cfg['n_layers'],
+            omega0=pinn_cfg['omega0'],
+            approx_type=pinn_cfg['approx_type'],
+            init_steepness=pinn_cfg['init_steepness'],
+        )
 
-        for approx_type in approx_types:
-            for run_id in range(n_runs):
-                # Set seed for reproducibility
-                seed = config['training']['base_seed'] + run_id
-                torch.manual_seed(seed)
-                np.random.seed(seed)
+        # Train
+        result = train_pinn(
+            model=model,
+            data=data,
+            device=train_cfg['device'],
+            max_epochs=train_cfg['max_epochs'],
+            lr=train_cfg['lr'],
+            patience=train_cfg['patience'],
+            log_interval=train_cfg['log_interval'],
+            loss_weights=train_cfg['loss_weights'],
+            save_history=True,
+        )
 
-                # Create model
-                model = DiscontinuousPINN(
-                    approx_type=approx_type,
-                    **config['model']
-                )
+        # Save training history
+        if result['history'] is not None:
+            hist_df = pd.DataFrame(result['history'])
+            hist_df.to_csv(run_dir / 'training_history.csv', index=False)
+            plot_training_curves(
+                hist_df, topology=topology,
+                save_path=str(run_dir / 'plot_training_curves.png'),
+                title=f'Run {run_id}')
 
-                # Train
-                result = train_pinn(
-                    model=model,
-                    data=data,
-                    device=config['training']['device'],
-                    max_epochs=config['training']['max_epochs'],
-                    lr=config['training']['lr'],
-                    patience=config['training']['patience'],
-                    log_interval=config['training']['log_interval'],
-                    loss_weights=config['training']['loss_weights'],
-                    save_history=True
-                )
+        # Save model checkpoint
+        if out_cfg.get('save_checkpoints', True):
+            torch.save(result['model_state'], run_dir / 'model_checkpoint.pt')
 
-                # Save training curve
-                if result['history'] is not None:
-                    hist_df = pd.DataFrame(result['history'])
-                    hist_path = (
-                        results_dir / 'training_curves' /
-                        f'{data_type}_{approx_type}_run{run_id:03d}.csv'
-                    )
-                    hist_df.to_csv(hist_path, index=False)
+        # Recovered parameters
+        rec = result['final_params']
+        with open(run_dir / 'recovered_params.json', 'w') as f:
+            json.dump({k: v.tolist() for k, v in rec.items()}, f, indent=2)
 
-                # Record results
-                all_results.append({
-                    'data_type': data_type,
-                    'approx_type': approx_type,
-                    'run_id': run_id,
-                    'seed': seed,
-                    'final_loss': result['final_loss'],
-                    'converged_epoch': result['converged_epoch'],
-                    'param_0': result['final_params'][0],
-                    'param_1': result['final_params'][1],
-                    'param_mean': result['final_params'].mean(),
-                    'param_std': result['final_params'].std()
-                })
+        # Re-simulate with recovered parameters
+        data_rec, _ = generate_trajectories(
+            topology=topology,
+            L=rec['L'], U=rec['U'], T=rec['T'], gamma=gamma,
+            approx_type=pinn_cfg['approx_type'],
+            steepness=rec['d'],
+            n_traj=len(ics), t_span=tuple(dg['t_span']),
+            n_points=dg['n_points'], seed=dg['seed'],
+            ics=ics,
+        )
+        data_rec.to_csv(run_dir / 'resimulated_trajectories.csv', index=False)
 
-                pbar.update(1)
-                pbar.set_postfix({
-                    'data': data_type,
-                    'approx': approx_type,
-                    'run': run_id,
-                    'loss': f"{result['final_loss']:.3e}"
-                })
+        # After-training visualizations
+        if n_nodes == 2:
+            plot_trajectories_comparison(
+                data, data_rec, n_nodes=n_nodes,
+                save_path=str(run_dir / 'plot_timeseries_comparison.png'))
+
+            params_true = {'L': L, 'U': U, 'T': T, 'gamma': gamma,
+                           'steepness': steepness, 'approx_type': approx_type_data}
+            params_rec = {'L': rec['L'], 'U': rec['U'], 'T': rec['T'],
+                          'gamma': gamma, 'steepness': rec['d'],
+                          'approx_type': pinn_cfg['approx_type']}
+            plot_phase_portrait_comparison(
+                topology, params_true, params_rec, trajectories=data,
+                save_path=str(run_dir / 'plot_phase_comparison.png'))
+
+            plot_parameter_comparison(
+                L, U, T, rec['L'], rec['U'], rec['T'],
+                save_path=str(run_dir / 'plot_parameter_comparison.png'))
+
+        # DSGRN comparison
+        comparison = {'gt_index': gt_index, 'rec_index': -1, 'same_region': False}
+        if dsgrn_available():
+            comparison = compare_dynamics(
+                config['network']['net_spec'], L, U, T,
+                rec['L'], rec['U'], rec['T'])
+            (run_dir / 'recovered_par_index.txt').write_text(str(comparison['rec_index']))
+            plot_morse_graph_comparison(
+                comparison.get('gt_morse_str', 'N/A'),
+                comparison.get('rec_morse_str', 'N/A'),
+                save_path=str(run_dir / 'plot_morse_comparison.png'))
+
+        # Parameter errors
+        L_err = np.abs(rec['L'] - L)
+        U_err = np.abs(rec['U'] - U)
+        T_err = np.abs(rec['T'] - T)
+
+        # Only compute errors for edges that exist
+        edge_mask = np.zeros_like(L, dtype=bool)
+        for s, t in topology.edge_list:
+            edge_mask[s, t] = True
+
+        comparison['L_mae'] = float(L_err[edge_mask].mean())
+        comparison['U_mae'] = float(U_err[edge_mask].mean())
+        comparison['T_mae'] = float(T_err[edge_mask].mean())
+
+        L_gt_masked = L[edge_mask]
+        U_gt_masked = U[edge_mask]
+        T_gt_masked = T[edge_mask]
+        comparison['L_mre'] = float((L_err[edge_mask] / (np.abs(L_gt_masked) + 1e-12)).mean())
+        comparison['U_mre'] = float((U_err[edge_mask] / (np.abs(U_gt_masked) + 1e-12)).mean())
+        comparison['T_mre'] = float((T_err[edge_mask] / (np.abs(T_gt_masked) + 1e-12)).mean())
+
+        with open(run_dir / 'comparison.json', 'w') as f:
+            json.dump({k: v for k, v in comparison.items()
+                       if isinstance(v, (int, float, bool, str))}, f, indent=2)
+
+        # Collect summary row
+        row = {
+            'run_id': run_id,
+            'seed': seed,
+            'final_loss': result['final_loss'],
+            'converged_epoch': result['converged_epoch'],
+            'same_dsgrn_region': comparison.get('same_region', False),
+            'gt_par_index': gt_index,
+            'rec_par_index': comparison.get('rec_index', -1),
+            'L_mae': comparison.get('L_mae', np.nan),
+            'U_mae': comparison.get('U_mae', np.nan),
+            'T_mae': comparison.get('T_mae', np.nan),
+        }
+        # Add per-edge recovered values
+        for prefix in ('L', 'U', 'T', 'd'):
+            for i, (s, t) in enumerate(topology.edge_list):
+                row[f'rec_{prefix}_{s}_{t}'] = float(rec[prefix][s, t])
+
+        all_results.append(row)
+        pbar.update(1)
+        pbar.set_postfix(loss=f"{result['final_loss']:.3e}")
 
     pbar.close()
 
-    # Save aggregated results
-    results_df = pd.DataFrame(all_results)
-    results_df.to_csv(results_dir / 'experiment_results.csv', index=False)
+    # Save summary
+    summary_df = pd.DataFrame(all_results)
+    summary_df.to_csv(after_dir / 'summary.csv', index=False)
 
-    print(f"\nResults saved to {results_dir / 'experiment_results.csv'}")
+    print(f"\nResults saved to {base_dir}")
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(summary_df[['run_id', 'final_loss', 'L_mae', 'U_mae', 'T_mae',
+                       'same_dsgrn_region']].to_string(index=False))
 
-    # Compute and display summary statistics
-    print("\n" + "="*80)
-    print("SUMMARY STATISTICS")
-    print("="*80)
-
-    summary = results_df.groupby(['data_type', 'approx_type']).agg({
-        'param_0': ['mean', 'std', 'min', 'max'],
-        'param_1': ['mean', 'std', 'min', 'max'],
-        'final_loss': ['mean', 'std']
-    }).round(4)
-
-    print(summary)
-
-    return results_df
+    return summary_df
