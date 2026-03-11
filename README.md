@@ -1,186 +1,93 @@
-# PINN for Learning Steepness in Discontinuous ODEs
+# PINN-DSGRN: Topology-Driven Parameter Recovery
 
-## Project Overview
+Physics-Informed Neural Networks for recovering ODE parameters (L, U, T, Hill exponent d) from trajectory data, guided by DSGRN network topology.
 
-This project uses Physics-Informed Neural Networks (PINNs) to learn steepness parameters when approximating discontinuous ODEs with smooth/piecewise functions.
+## Core Idea
 
-**Core Question:** Given trajectory data from different vector field types (discontinuous Heaviside, steep Hill function, steep piecewise linear), can we learn the steepness parameter (Hill exponent `n` or piecewise width `h`) that best fits the data through PINN optimization?
+Given a DSGRN network specification and trajectory data generated under smooth (Hill/ramp) approximations to discontinuous ODEs, train a PINN to recover the per-edge parameters that produced the data. The recovered parameters are validated against the DSGRN parameter index and Morse graph.
 
-## Systems
-
-The project focuses on a two-dimensional discontinuous ODE system:
+**ODE system** for network with n nodes:
 
 ```
-x_0' = -x_0 + U_1 + H(T_2 - x_1)(L_1 - U_1)
-x_1' = -x_1 + U_2 + H(T_1 - x_0)(L_2 - U_2)
+dy_i/dt = -gamma_i * y_i + logic_tree_i(y)
 ```
 
-Where `H(·)` is the Heaviside function and parameters are `U = (5, 5)`, `L = (1, 1)`, `T = (3, 3)`.
-
-**Approximations to Learn:**
-
-1. **Hill function:** `H(\theta - x) \approx \theta^n / (\theta^n + x^n)` → learn `n`
-2. **Piecewise linear:** Ramp with width `2h` → learn `h`
+where `logic_tree_i` recursively evaluates sums and products of sigma functions (Hill or piecewise-linear approximations to Heaviside), each parameterized by per-edge L (lower), U (upper), T (threshold), and d (steepness).
 
 ## Installation
-
-1. Clone this repository
-2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Project Structure
-
-```
-pinn_discontinuous/
-├── src/
-│   ├── __init__.py
-│   ├── data_generator.py      # Generate trajectories from 3 vector field types
-│   ├── models.py              # PINN architecture (SIREN-based)
-│   ├── trainer.py             # Training loop with loss computation
-│   ├── experiment_runner.py   # Batch experiments + hyperparameter management
-│   └── utils.py               # Metrics, plotting, checkpointing
-├── configs/
-│   └── experiment_config.yaml # All hyperparameters
-├── data/                      # Generated trajectories
-│   ├── heaviside_trajectories.csv
-│   ├── hill_trajectories.csv
-│   └── piecewise_trajectories.csv
-├── results/                   # Outputs
-│   ├── experiment_results.csv # Main results table
-│   ├── training_curves/       # Loss/parameter evolution per run
-│   └── figures/               # Analysis plots
-├── notebooks/
-│   └── analysis.ipynb         # Posterior statistical analysis
-├── requirements.txt
-├── README.md
-└── run_experiments.py         # Main entry point
-```
+Optional: install [DSGRN](https://github.com/marciogameiro/DSGRN) and dsgrn_utils for parameter index computation and Morse graph validation. The core pipeline works without them.
 
 ## Usage
 
-### Running Experiments
+### Stage 1: Data Generation
 
-Run the full experimental suite (6 experiments by default: 3 data types × 2 approximation types × 1 run):
-
-```bash
-python run_experiments.py
-```
-
-Or with a custom configuration:
+Generate DSGRN-compatible parameters and trajectory data across a Hill exponent sweep:
 
 ```bash
-python run_experiments.py --config configs/custom_config.yaml
+python scripts/run_pipeline.py
 ```
 
-### Configuration
+This parses the network specification, generates well-separated threshold parameters for target DSGRN parameter indices, and integrates the ODE system for each Hill exponent value. Output goes to `results/hill_sweep/{run_id}/`.
 
-Edit `configs/experiment_config.yaml` to customize:
+### Stage 2: PINN Recovery
 
-- Number of runs per experiment (default: 1, set `n_runs: 20` for statistical analysis)
-- Number of trajectories and time points
-- Ground truth parameters (`hill_n: 10.0`, `pw_h: 1.0`)
-- Model architecture (hidden layers, SIREN frequency)
-- Training hyperparameters (learning rate, epochs, patience)
-- Loss function weights
-- Device selection ('mps', 'cuda', or 'cpu')
-
-### Generating Plots
-
-After experiments complete, generate summary plots:
+Train PINNs to recover per-edge parameters from Stage 1 trajectory data:
 
 ```bash
-python plot_summary.py
+python scripts/run_pinn_recovery.py
 ```
 
-This creates:
-- Parameter summary bar charts
-- Scatter plots by approximation type
-- Training curve visualizations
+Output (recovered parameters, training history, comparison plots, re-simulated trajectories) goes to `results/pinn_recovery/{campaign_id}/`.
 
-Alternatively, use the analysis notebook:
+Configuration for both stages is via constants at the top of each script.
 
-```bash
-jupyter notebook notebooks/analysis.ipynb
-```
-
-## Experimental Design
-
-### Three Data Sources
-
-1. **Heaviside (discontinuous):** True vector field with step functions
-2. **Hill (steep continuous):** Vector field with `n = 10` (steep)
-3. **Piecewise (steep continuous):** Vector field with `h = 1.0` (moderate transition width)
-
-### Two Approximation Types
-
-1. **Hill approximation:** Learn 2 parameters `n = [n_0, n_1]`
-2. **Piecewise approximation:** Learn 2 parameters `h = [h_0, h_1]`
-
-### Experiment Matrix
+## Project Structure
 
 ```
-3 data types × 2 approximation types × 1 run = 6 training runs
+├── src/
+│   ├── network_parser.py      # Parse net_spec -> NetworkTopology with logic trees
+│   ├── sigma_functions.py     # Dual-backend (numpy/torch) Hill and ramp functions
+│   ├── ode_builder.py         # Build ODE RHS from topology via recursive tree eval
+│   ├── data_generator.py      # Latin hypercube ICs + solve_ivp trajectory generation
+│   ├── models.py              # DSGRNPinn: SIREN + learnable per-edge L/U/T/d
+│   ├── trainer.py             # Training loop (data + physics + IC loss), early stopping
+│   ├── dsgrn_interface.py     # DSGRN parameter index, Morse graph, T generation
+│   ├── pinn_recovery.py       # Recovery pipeline orchestration and analysis
+│   ├── utils.py               # Visualization and run ID utilities
+│   └── experiment_runner.py   # Alternative YAML-based orchestration
+├── scripts/
+│   ├── run_pipeline.py            # Stage 1 orchestrator
+│   ├── run_pinn_recovery.py       # Stage 2 orchestrator
+│   ├── generate_dsgrn_params.py   # Standalone parameter generation
+│   └── hill_sweep.py              # Standalone Hill exponent sweep
+├── notebooks/                 # Exploration and analysis
+├── results/                   # All pipeline outputs
+├── configs/                   # (reserved for future config files)
+└── requirements.txt
 ```
 
-For each (data_type, approx_type) pair:
+## PINN Architecture
 
-- Compute mean \mu and standard deviation \sigma of learned parameters
-- Report confidence interval [\mu - \sigma, \mu + \sigma]
-- Analyze robustness and convergence patterns
+**SIREN** (Sinusoidal Representation Network) with sine activations:
+- Input: `(t, ic_0, ..., ic_{n-1})`
+- Output: `(x_0, ..., x_{n-1})`
+- Learnable per-edge parameters with reparameterization enforcing `0 < L < T < U`
 
-## Model Architecture
-
-The project uses a **SIREN (Sinusoidal Representation Network)** architecture:
-
-- Periodic activation functions good for high-frequency features
-- Input: (t, ic_0, ic_1) → time and initial conditions
-- Output: (x_0, x_1) → predicted states
-- Learnable steepness parameters (log-parameterized for positivity)
-
-## Loss Function
-
-Combined loss:
-
-- **Data loss:** MSE between prediction and ground truth trajectories
-- **Physics loss:** ODE residual via automatic differentiation
-- **IC loss:** Initial condition constraint (soft penalty)
-
-## Expected Outputs
-
-1. **Main Results Table** (`results/experiment_results.csv`):
-   - 6 rows with final parameters, losses, convergence epochs
-   - Statistical summary printed to console
-
-2. **Training Curves** (`results/training_curves/*.csv`):
-   - Per-run evolution of losses and parameters
-
-3. **Analysis Figures** (`results/figures/`):
-   - Parameter distributions with confidence intervals
-   - Loss vs parameter correlations
-   - Convergence time histograms
-
-## Success Criteria
-
-1. All experiments complete without errors
-2. Gathered learned parameters, training data, etc.
-3. Confidence intervals [\mu - \sigma, \mu + \sigma] have reasonable width (\sigma/\mu < 0.3)
-4. Learned params are validated by DSGRN (or analytical) bounds
+**Loss:** `w_data * ||x_pred - x_true||^2 + w_phys * ||dx/dt - f(x)||^2 + w_ic * ||x(0) - ic||^2`
 
 ## Dependencies
 
-- PyTorch ≥ 2.0.0
-- NumPy ≥ 1.24.0
-- SciPy ≥ 1.10.0
-- Pandas ≥ 2.0.0
-- Matplotlib ≥ 3.7.0
-- Seaborn ≥ 0.12.0
-- PyYAML ≥ 6.0
-- tqdm ≥ 4.65.0
-- Jupyter ≥ 1.0.0
-
-## License
-
-[To be determined]
+- PyTorch >= 2.0.0
+- NumPy >= 1.24.0
+- SciPy >= 1.10.0
+- Pandas >= 2.0.0
+- Matplotlib >= 3.7.0
+- Seaborn >= 0.12.0
+- PyYAML >= 6.0
+- tqdm >= 4.65.0
+- DSGRN (optional)

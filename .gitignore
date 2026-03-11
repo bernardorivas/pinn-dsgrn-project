@@ -23,6 +23,7 @@ notebooks/
 # Claude / Serena
 .claude/
 .serena/
+Claude.md
 
 # LaTeX draft
 draft/
