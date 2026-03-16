@@ -17,8 +17,12 @@ notebooks/
 # macOS
 .DS_Store
 
-# Generated results
-# results/
+# Generated results (keep dsgrn_figs tracked)
+results/*
+!results/dsgrn_figs/
+
+# Data mapping (keeps d values private)
+data/d_mapping.json
 
 # Claude / Serena
 .claude/
