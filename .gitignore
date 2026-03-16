@@ -36,7 +36,7 @@ scripts/par_index_712_parameters.py
 # Claude / Serena
 .claude/
 .serena/
-Claude.md
+CLAUDE.md
 
 # LaTeX draft
 draft/
