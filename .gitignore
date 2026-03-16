@@ -20,6 +20,7 @@ notebooks/
 # Generated results (keep dsgrn_figs tracked)
 results/*
 !results/dsgrn_figs/
+!results/timeseries_plots/
 
 # Data mapping (keeps d values private)
 data/d_mapping.json
