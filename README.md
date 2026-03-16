@@ -70,15 +70,15 @@ Configuration for both stages is via constants at the top of each script.
 ├── configs/                   # (reserved for future config files)
 └── requirements.txt
 ```
-
-## PINN Architecture
-
+<!-- 
+## PINN Architecture -->
+<!-- 
 **SIREN** (Sinusoidal Representation Network) with sine activations:
 - Input: `(t, ic_0, ..., ic_{n-1})`
 - Output: `(x_0, ..., x_{n-1})`
 - Learnable per-edge parameters with reparameterization enforcing `0 < L < T < U`
 
-**Loss:** `w_data * ||x_pred - x_true||^2 + w_phys * ||dx/dt - f(x)||^2 + w_ic * ||x(0) - ic||^2`
+**Loss:** `w_data * ||x_pred - x_true||^2 + w_phys * ||dx/dt - f(x)||^2 + w_ic * ||x(0) - ic||^2` -->
 
 ## Dependencies
 
