@@ -25,6 +25,14 @@ results/*
 # Data mapping
 data/d_mapping.json
 
+# PINN / ML (Stage 2)
+src/models.py
+src/trainer.py
+src/pinn_recovery.py
+src/experiment_runner.py
+scripts/run_pinn_recovery.py
+scripts/par_index_712_parameters.py
+
 # Claude / Serena
 .claude/
 .serena/
